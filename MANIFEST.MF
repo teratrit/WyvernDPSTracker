@@ -1,0 +1,3 @@
+Agent-Class: dps3.DPSAgent
+Can-Retransform-Classes: false
+Can-Redefine-Classes: false

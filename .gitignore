@@ -1,0 +1,6 @@
+dps_events*.log
+*.lock
+__pycache__/
+*.pyc
+build/
+*.spec

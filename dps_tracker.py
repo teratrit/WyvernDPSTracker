@@ -22,7 +22,8 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 LOG_FILE = SCRIPT_DIR / "dps_events_v2.log"
-SESSION_GAP = 5  # seconds of no hits = session ends
+SESSION_GAP = 15     # seconds of no hits before session ends
+SESSION_BACKTRACK = True  # snap end time back to last hit (not the gap timeout)
 
 # ============================================================
 # Damage categorization

@@ -5,3 +5,5 @@ __pycache__/
 build/
 *.spec
 dist/dps_events*
+agent_v*.jar
+test_*.log

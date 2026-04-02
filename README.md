@@ -14,8 +14,9 @@ Grab `WyvernDPSTracker.exe` from the [latest release](https://github.com/teratri
 ## Usage
 
 1. Open Wyvern, log in
-2. Run `WyvernDPSTracker.exe`
-3. Fight stuff
+2. Make sure hit messages are on (`hitmsgs on` in the command bar)
+3. Run `WyvernDPSTracker.exe`
+4. Fight stuff
 
 Outgoing and incoming damage are tracked separately. Sessions auto-start when you deal or take damage, and auto-end after 5 seconds of no combat.
 

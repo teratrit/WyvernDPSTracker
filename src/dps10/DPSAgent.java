@@ -1,4 +1,4 @@
-package dps9;
+package dps10;
 
 import wyvern.client.Client;
 import wyvern.client.GameWindow;
@@ -179,6 +179,12 @@ public class DPSAgent {
     }
 
     private static void processLine(String line) {
+        // Player death
+        if (line.contains("You have died") || line.contains("You die")) {
+            writeEvent("DEATH", line);
+            return;
+        }
+
         if (KILL_PATTERN.matcher(line).find()) {
             writeEvent("KILL", line);
         }

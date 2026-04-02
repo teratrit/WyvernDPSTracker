@@ -223,6 +223,12 @@ class DPSTrackerGUI:
             v.pack(side=tk.RIGHT)
             self.time_labels[key] = v
 
+        # Reset button
+        btn_frame = tk.Frame(self.root, bg='#0d1117')
+        btn_frame.pack(fill=tk.X, padx=12, pady=2)
+        tk.Button(btn_frame, text="Reset", font=sm, bg='#21262d', fg='#c9d1d9',
+                  bd=0, cursor='hand2', width=8, command=self._reset).pack(side=tk.LEFT)
+
         # Combat log
         lf = tk.Frame(self.root, bg='#0d1117')
         lf.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 8))
@@ -421,10 +427,23 @@ class DPSTrackerGUI:
             self.last_in_ms = ts
 
             elapsed = (ts - self.in_session.start_ms) / 1000.0
-            self._log(f"   IN {elapsed:6.2f}s {dmg:>5d} [{cat}]", 'in')
+            self._log(f"   IN {elapsed:6.2f}s {dmg:>5d}", 'in')
 
         elif etype == "KILL":
             self._log(f"  KILL  {data}", 'kill')
+            # End outgoing session if Training Dummy killed
+            if 'Training Dummy' in data:
+                if self.out_session and self.out_session.active:
+                    self._end('out')
+                if self.in_session and self.in_session.active:
+                    self._end('in')
+
+        elif etype == "DEATH":
+            self._log(f"  DIED", 'in')
+            if self.out_session and self.out_session.active:
+                self._end('out')
+            if self.in_session and self.in_session.active:
+                self._end('in')
 
         # Cap dedup set
         if len(self._seen) > 10000:
@@ -467,6 +486,22 @@ class DPSTrackerGUI:
         self.log.insert(tk.END, text + "\n", tag)
         self.log.see(tk.END)
         self.log.config(state=tk.DISABLED)
+
+    def _reset(self):
+        """Reset all sessions and clear the log."""
+        if self.out_session and self.out_session.active:
+            self._end('out')
+        if self.in_session and self.in_session.active:
+            self._end('in')
+        self.out_session = None
+        self.in_session = None
+        self.last_out_ms = 0
+        self.last_in_ms = 0
+        self._seen.clear()
+        self.log.config(state=tk.NORMAL)
+        self.log.delete('1.0', tk.END)
+        self.log.config(state=tk.DISABLED)
+        self.status.config(text="Reset. Start fighting.", fg='#3fb950')
 
     def _on_close(self):
         self._shutdown = True

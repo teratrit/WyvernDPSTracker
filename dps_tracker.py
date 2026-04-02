@@ -201,13 +201,13 @@ class DPSTrackerGUI:
                                bg='#0d1117', font=sm, anchor='w')
         self.status.pack(fill=tk.X, padx=12, pady=(8, 0))
 
-        # Outgoing
+        # Outgoing (with type breakdown)
         self.out_dps, self.out_stats, self.out_bd = self._build_section(
-            "OUTGOING", '#3fb950', big, lbl, sm, mono)
+            "OUTGOING", '#3fb950', big, lbl, sm, mono, breakdown=True)
 
-        # Incoming
+        # Incoming (no type breakdown — damage comes from HP tracking)
         self.in_dps, self.in_stats, self.in_bd = self._build_section(
-            "INCOMING", '#f85149', big, lbl, sm, mono)
+            "INCOMING", '#f85149', big, lbl, sm, mono, breakdown=False)
 
         # Timing
         tf = tk.Frame(self.root, bg='#161b22', bd=1, relief='groove')
@@ -238,7 +238,7 @@ class DPSTrackerGUI:
 
         self._tick()
 
-    def _build_section(self, title, color, big, lbl, sm, mono):
+    def _build_section(self, title, color, big, lbl, sm, mono, breakdown=True):
         """Build an outgoing/incoming section. Returns (dps_label, stats_dict, breakdown_widget)."""
         hdr = tk.Frame(self.root, bg='#0d1117')
         hdr.pack(fill=tk.X, padx=12, pady=(6, 0))
@@ -261,14 +261,16 @@ class DPSTrackerGUI:
             v.pack(side=tk.RIGHT)
             stats[key] = v
 
-        bd = tk.Text(self.root, bg='#161b22', fg='#c9d1d9', font=('Consolas', 9),
-                     height=5, bd=1, relief='groove', state=tk.DISABLED,
-                     wrap=tk.NONE, highlightthickness=0)
-        bd.pack(fill=tk.X, padx=12, pady=2)
-        for cat, c in TYPE_COLORS.items():
-            bd.tag_configure(cat, foreground=c)
-        bd.tag_configure('Unknown', foreground='#8b949e')
-        bd.tag_configure('hdr', foreground='#7d8590')
+        bd = None
+        if breakdown:
+            bd = tk.Text(self.root, bg='#161b22', fg='#c9d1d9', font=('Consolas', 9),
+                         height=5, bd=1, relief='groove', state=tk.DISABLED,
+                         wrap=tk.NONE, highlightthickness=0)
+            bd.pack(fill=tk.X, padx=12, pady=2)
+            for cat, c in TYPE_COLORS.items():
+                bd.tag_configure(cat, foreground=c)
+            bd.tag_configure('Unknown', foreground='#8b949e')
+            bd.tag_configure('hdr', foreground='#7d8590')
 
         return dps_lbl, stats, bd
 
@@ -320,7 +322,9 @@ class DPSTrackerGUI:
         stats["Avg"].config(text=f"{session.avg_hit:.0f}")
         stats["Max"].config(text=str(session.max_hit))
 
-        # Breakdown table
+        # Breakdown table (only if widget exists)
+        if bd is None:
+            return
         bd.config(state=tk.NORMAL)
         bd.delete('1.0', tk.END)
         bd.insert(tk.END, f"{'Type':<10}{'Hits':>5}{'Dmg':>8}{'Avg':>6}{'DPS':>7}{'%':>5}\n", 'hdr')
@@ -400,21 +404,20 @@ class DPSTrackerGUI:
             self.status.config(text="Tracking...", fg='#3fb950')
 
         elif etype == "IN":
-            parts = data.split('|', 1)
             try:
-                dmg = int(parts[0])
+                dmg = int(data.split('|', 1)[0])
             except ValueError:
                 return
-            msg = parts[1] if len(parts) > 1 else ""
+            if dmg <= 0:
+                return
 
             if ('in', ts, dmg) in self._seen:
                 return
             self._seen.add(('in', ts, dmg))
 
-            cat = categorize_incoming(msg)
             if not self.in_session or not self.in_session.active:
                 self._start('in')
-            self.in_session.add_hit(ts, dmg, cat)
+            self.in_session.add_hit(ts, dmg)
             self.last_in_ms = ts
 
             elapsed = (ts - self.in_session.start_ms) / 1000.0

@@ -176,7 +176,8 @@ class DPSTrackerGUI:
         self.last_in_ms = 0
         self._seen = set()
         self._shutdown = False
-        self._has_message_text = False  # True once agent sends messages with text
+        self._has_message_text = False
+        self._out_is_dummy = False  # True when current outgoing session is vs Training Dummy
 
         self._build_ui()
         self._start_log_reader()
@@ -400,8 +401,17 @@ class DPSTrackerGUI:
             self._seen.add(('out', ts, dmg))
 
             cat = categorize_outgoing(msg)
-            if not self.out_session or not self.out_session.active:
+            is_dummy = 'Training Dummy' in msg
+
+            # Training Dummy: force new session on first hit
+            if is_dummy and (not self.out_session or not self.out_session.active
+                             or not self._out_is_dummy):
                 self._start('out')
+                self._out_is_dummy = True
+            elif not is_dummy and (not self.out_session or not self.out_session.active):
+                self._start('out')
+                self._out_is_dummy = False
+
             self.out_session.add_hit(ts, dmg, cat)
             self.last_out_ms = ts
 
@@ -435,8 +445,7 @@ class DPSTrackerGUI:
             if 'Training Dummy' in data:
                 if self.out_session and self.out_session.active:
                     self._end('out')
-                if self.in_session and self.in_session.active:
-                    self._end('in')
+                self._out_is_dummy = False
 
         elif etype == "DEATH":
             self._log(f"  DIED", 'in')
@@ -498,6 +507,7 @@ class DPSTrackerGUI:
         self.last_out_ms = 0
         self.last_in_ms = 0
         self._seen.clear()
+        self._out_is_dummy = False
         self.log.config(state=tk.NORMAL)
         self.log.delete('1.0', tk.END)
         self.log.config(state=tk.DISABLED)

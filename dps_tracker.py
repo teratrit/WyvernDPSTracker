@@ -30,12 +30,12 @@ SESSION_BACKTRACK = True  # snap end time back to last hit (not the gap timeout)
 # ============================================================
 
 ELEMENT_PATTERNS = [
+    (re.compile(r'poison|venom', re.I), 'Poison'),
     (re.compile(r'lightning|energy surge|shocked|electr', re.I), 'Shock'),
     (re.compile(r'flame|burn|fire|inferno|incinerat|scorch|sear|magma|lava|\bhot\b', re.I), 'Fire'),
-    (re.compile(r'arctic|glacial|frost|freeze|froze|chill|frozen|cold|\bice\b|blizzard', re.I), 'Cold'),
+    (re.compile(r'arctic|glacial|frost|freeze|froze|chill|\bice\b|blizzard', re.I), 'Cold'),
     (re.compile(r'acid|corrosi|dissolv|caustic', re.I), 'Acid'),
     (re.compile(r'death|necrotic|drain|dark energy|shadow|unholy|wither', re.I), 'Death'),
-    (re.compile(r'poison', re.I), 'Poison'),
     (re.compile(r'holy|radiance|divinity|divine|vengeance|sacred', re.I), 'Holy'),
     (re.compile(r'spirit|rend', re.I), 'Magic'),
 ]
@@ -82,25 +82,55 @@ TYPE_COLORS = {
 }
 
 
-def _check_elements(msg):
+def _check_elements(text):
     """Check for elemental keywords. Returns type or None."""
     for pat, dtype in ELEMENT_PATTERNS:
-        if pat.search(msg):
+        if pat.search(text):
             return dtype
     return None
+
+
+# Verbs that unambiguously indicate a damage type
+VERB_TYPES = {
+    'poisoned': 'Poison', 'poison': 'Poison',
+    'froze': 'Cold', 'freeze': 'Cold',
+    'burned': 'Fire', 'burn': 'Fire', 'scorched': 'Fire', 'scorch': 'Fire',
+    'shocked': 'Shock', 'shock': 'Shock', 'zapped': 'Shock', 'zap': 'Shock',
+    'corroded': 'Acid', 'corrode': 'Acid',
+}
+
+# Extract flavor text: the part after prepositions (with/in) before "for X damage"
+FLAVOR_RE = re.compile(r'\b(?:with|in)\s+(.+?)\s+for\s+\d+\s+damage', re.I)
 
 
 def categorize_outgoing(msg):
     if not msg:
         return 'Unknown'
-    elem = _check_elements(msg)
-    if elem:
-        return elem
+
+    # 1. Check verb first — unambiguous type verbs beat everything
+    m = OUTGOING_VERB_RE.match(msg)
+    if m:
+        verb = m.group(1).lower()
+        if verb in VERB_TYPES:
+            return VERB_TYPES[verb]
+
+    # 2. Check element keywords in flavor text only (avoids monster name matches)
+    #    Flavor = text after "with/in" preposition before "for X damage"
+    flavor = FLAVOR_RE.search(msg)
+    if flavor:
+        elem = _check_elements(flavor.group(1))
+        if elem:
+            return elem
+
+    # 3. Check "'s spirit" / "rend" patterns (for "Your claws rend X's spirit")
+    if re.search(r"'s spirit\b", msg, re.I) or re.search(r'\brend\b', msg, re.I):
+        return 'Magic'
+
+    # 4. Physical type from verb
     if HOLE_RE.search(msg):
         return 'Stab'
     if NEARLY_CUT_RE.search(msg):
         return 'Cut'
-    m = OUTGOING_VERB_RE.match(msg)
     if m:
         return OUTGOING_VERBS.get(m.group(1).lower(), 'Unknown')
     return 'Unknown'

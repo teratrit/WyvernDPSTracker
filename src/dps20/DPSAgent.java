@@ -1,4 +1,4 @@
-package dps10;
+package dps20;
 
 import wyvern.client.Client;
 import wyvern.client.GameWindow;
@@ -6,8 +6,7 @@ import wyvern.client.ServerOutput;
 
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
-import javax.swing.text.BadLocationException;
-import javax.swing.text.Document;
+import javax.swing.text.*;
 import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
@@ -23,25 +22,27 @@ public class DPSAgent {
 
     private static final Pattern DAMAGE_PATTERN =
         Pattern.compile("for\\s+(\\d+)\\s+damage", Pattern.CASE_INSENSITIVE);
-    private static final Pattern OUTGOING_RE =
-        Pattern.compile("^You\\s+\\w+", Pattern.CASE_INSENSITIVE);
     private static final Pattern KILL_PATTERN =
         Pattern.compile("(?:You killed |You destroy |is destroyed|is dead)", Pattern.CASE_INSENSITIVE);
 
     private static BufferedWriter logWriter;
-    private static Document activeDocument;
+    private static StyledDocument activeDocument;
     private static DocumentListener activeListener;
-    private static Object statProxy;       // dynamic proxy for StatModel.Observer
-    private static Object statModel;       // the StatModel instance
+    private static Object statProxy;
+    private static Object statModel;
     private static volatile boolean active = false;
     private static Thread watchThread;
 
     // HP tracking
     private static volatile int lastHp = -1;
 
+    // Pending incoming message — red text captured from ServerOutput, consumed by HP tracker
+    private static volatile String pendingIncomingMsg = null;
+    private static volatile long pendingIncomingTs = 0;
+
     public static void agentmain(String agentArgs, Instrumentation inst) {
         String logPath = agentArgs;
-        System.out.println("[DPS] Agent loaded. Log: " + logPath);
+        System.out.println("[DPS] Agent loaded (v20). Log: " + logPath);
 
         removeAll();
         if (watchThread != null) { watchThread.interrupt(); watchThread = null; }
@@ -49,7 +50,7 @@ public class DPSAgent {
 
         try {
             logWriter = new BufferedWriter(new FileWriter(logPath, false));
-            writeEvent("AGENT_READY", "v9");
+            writeEvent("AGENT_READY", "v20");
         } catch (IOException e) {
             System.err.println("[DPS] Cannot open log: " + e.getMessage());
             return;
@@ -77,22 +78,57 @@ public class DPSAgent {
         t.start();
     }
 
+    /**
+     * Get the style name for text at the given offset.
+     * Game uses named styles: "damage" (incoming/red), "hit" (outgoing/blue), etc.
+     */
+    private static String getStyleName(StyledDocument doc, int offset) {
+        try {
+            Element el = doc.getCharacterElement(offset);
+            AttributeSet attrs = el.getAttributes();
+            // The style is set via document.insertString(offset, text, style)
+            // The Style object's name is stored in the resolve parent
+            AttributeSet parent = attrs.getResolveParent();
+            if (parent instanceof Style) {
+                String name = ((Style) parent).getName();
+                if (name != null) return name;
+            }
+            // Fallback: check NameAttribute directly
+            Object nameAttr = attrs.getAttribute(StyleConstants.NameAttribute);
+            if (nameAttr != null) return nameAttr.toString();
+        } catch (Exception ignored) {}
+        return "";
+    }
+
     private static void attachDocument(GameWindow gw) {
         ServerOutput so = gw.getServerOutput();
         if (so == null) { writeEvent("ERROR", "ServerOutput null"); return; }
 
-        Document doc = so.getDocument();
+        Document rawDoc = so.getDocument();
+        if (!(rawDoc instanceof StyledDocument)) {
+            writeEvent("ERROR", "Document is not StyledDocument");
+            return;
+        }
+        StyledDocument doc = (StyledDocument) rawDoc;
+
         DocumentListener listener = new DocumentListener() {
             @Override
             public void insertUpdate(DocumentEvent e) {
                 if (!active) return;
                 try {
-                    String text = e.getDocument().getText(e.getOffset(), e.getLength()).trim();
+                    int offset = e.getOffset();
+                    int length = e.getLength();
+                    String text = doc.getText(offset, length).trim();
                     if (text.isEmpty()) return;
-                    for (String line : text.split("\n")) {
+
+                    // Get the exact style name: "damage" = incoming, "hit" = outgoing
+                    String styleName = getStyleName(doc, offset);
+
+                    String[] lines = text.split("\n");
+                    for (String line : lines) {
                         line = line.trim();
                         if (line.isEmpty()) continue;
-                        processLine(line);
+                        processLine(line, styleName);
                     }
                 } catch (BadLocationException ignored) {}
             }
@@ -104,14 +140,12 @@ public class DPSAgent {
         activeDocument = doc;
         activeListener = listener;
         active = true;
-        System.out.println("[DPS] Document listener attached");
-        writeEvent("ATTACHED", "v9");
+        System.out.println("[DPS] Document listener attached (styled)");
+        writeEvent("ATTACHED", "v20");
     }
 
     /**
      * Attach to StatModel for HP tracking using reflection + dynamic proxy.
-     * This avoids direct references to StatModel.Observer which may differ
-     * between game client versions.
      */
     private static void attachHpTracker(GameWindow gw) {
         try {
@@ -121,12 +155,7 @@ public class DPSAgent {
                 return;
             }
 
-            // Find the Observer interface dynamically
             Class<?> observerClass = null;
-            for (Class<?> inner : sm.getClass().getInterfaces()) {
-                // skip
-            }
-            // It's an inner interface of StatModel
             try {
                 observerClass = Class.forName("wyvern.client.StatModel$Observer");
             } catch (ClassNotFoundException e) {
@@ -134,7 +163,6 @@ public class DPSAgent {
                 return;
             }
 
-            // Create a dynamic proxy that handles onHpChanged
             InvocationHandler handler = new InvocationHandler() {
                 @Override
                 public Object invoke(Object proxy, Method method, Object[] args) {
@@ -144,10 +172,18 @@ public class DPSAgent {
                         lastHp = hp;
                         if (prev > 0 && hp < prev) {
                             int dmg = prev - hp;
-                            writeEvent("IN", String.valueOf(dmg));
+                            // Grab pending incoming message if recent (within 500ms)
+                            String msg = pendingIncomingMsg;
+                            long msgTs = pendingIncomingTs;
+                            long now = System.currentTimeMillis();
+                            if (msg != null && (now - msgTs) < 500) {
+                                pendingIncomingMsg = null;
+                                writeEvent("IN", dmg + "|" + msg);
+                            } else {
+                                writeEvent("IN", String.valueOf(dmg));
+                            }
                         }
                     }
-                    // Return null for all void methods
                     return null;
                 }
             };
@@ -158,12 +194,10 @@ public class DPSAgent {
                 handler
             );
 
-            // Call sm.addObserver(proxy) via reflection
             Method addObs = sm.getClass().getMethod("addObserver", observerClass);
             addObs.invoke(sm, statProxy);
             statModel = sm;
 
-            // Seed initial HP via syncAll
             try {
                 Method syncAll = sm.getClass().getMethod("syncAll", observerClass);
                 syncAll.invoke(sm, statProxy);
@@ -178,7 +212,7 @@ public class DPSAgent {
         }
     }
 
-    private static void processLine(String line) {
+    private static void processLine(String line, String styleName) {
         // Player death
         if (line.contains("You have died") || line.contains("You die")) {
             writeEvent("DEATH", line);
@@ -189,12 +223,18 @@ public class DPSAgent {
             writeEvent("KILL", line);
         }
 
-        Matcher dmg = DAMAGE_PATTERN.matcher(line);
-        if (!dmg.find()) return;
-        String damage = dmg.group(1);
+        // "damage" style = incoming (red text) — store as pending for HP tracker
+        if ("damage".equals(styleName)) {
+            pendingIncomingMsg = line;
+            pendingIncomingTs = System.currentTimeMillis();
+            return;
+        }
 
-        // Outgoing only — incoming is handled by HP tracking
-        if (OUTGOING_RE.matcher(line).find()) {
+        // "hit" style = outgoing (blue text)
+        if ("hit".equals(styleName)) {
+            Matcher dmg = DAMAGE_PATTERN.matcher(line);
+            if (!dmg.find()) return;
+            String damage = dmg.group(1);
             writeEvent("OUT", damage + "|" + line);
         }
     }
@@ -207,7 +247,6 @@ public class DPSAgent {
         activeDocument = null;
         activeListener = null;
 
-        // Remove stat observer via reflection
         if (statModel != null && statProxy != null) {
             try {
                 Class<?> obsClass = Class.forName("wyvern.client.StatModel$Observer");
@@ -219,6 +258,7 @@ public class DPSAgent {
         statModel = null;
         statProxy = null;
         lastHp = -1;
+        pendingIncomingMsg = null;
     }
 
     private static void startWatchThread(String lockPath) {

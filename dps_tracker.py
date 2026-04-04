@@ -31,10 +31,13 @@ SESSION_BACKTRACK = True  # snap end time back to last hit (not the gap timeout)
 
 ELEMENT_PATTERNS = [
     (re.compile(r'lightning|energy surge|shocked|electr', re.I), 'Shock'),
-    (re.compile(r'flame|burn|fire|inferno|incinerat|scorch|sear|magma|lava', re.I), 'Fire'),
-    (re.compile(r'arctic|glacial|frost|freeze|chill|frozen|cold|\bice\b|blizzard', re.I), 'Cold'),
+    (re.compile(r'flame|burn|fire|inferno|incinerat|scorch|sear|magma|lava|\bhot\b', re.I), 'Fire'),
+    (re.compile(r'arctic|glacial|frost|freeze|froze|chill|frozen|cold|\bice\b|blizzard', re.I), 'Cold'),
     (re.compile(r'acid|corrosi|dissolv|caustic', re.I), 'Acid'),
     (re.compile(r'death|necrotic|drain|dark energy|shadow|unholy|wither', re.I), 'Death'),
+    (re.compile(r'poison', re.I), 'Poison'),
+    (re.compile(r'holy|radiance|divinity|divine|vengeance|sacred', re.I), 'Holy'),
+    (re.compile(r'spirit|rend', re.I), 'Magic'),
 ]
 
 OUTGOING_VERB_RE = re.compile(r'^You\s+(\w+)', re.I)
@@ -46,20 +49,23 @@ OUTGOING_VERBS = {
     'slam': 'Smash', 'slammed': 'Smash', 'bash': 'Smash', 'bashed': 'Smash',
     'pummel': 'Smash', 'pummeled': 'Smash', 'smote': 'Smash', 'smite': 'Smash',
     'drown': 'Smash', 'drowned': 'Smash', 'stagger': 'Smash', 'staggered': 'Smash',
-    'hit': 'Smash', 'strike': 'Smash', 'struck': 'Smash',
+    'hit': 'Smash', 'strike': 'Smash', 'struck': 'Smash', 'graze': 'Smash', 'grazed': 'Smash',
     'blast': 'Smash', 'blasted': 'Smash', 'zap': 'Smash', 'zapped': 'Smash',
     'overwhelm': 'Smash', 'overwhelmed': 'Smash', 'engulf': 'Smash', 'engulfed': 'Smash',
     'scorch': 'Smash', 'scorched': 'Smash', 'shock': 'Smash', 'shocked': 'Smash',
+    'decimate': 'Smash', 'decimated': 'Smash',
+    'condemn': 'Smash', 'condemned': 'Smash',
     'stab': 'Stab', 'stabbed': 'Stab', 'pierce': 'Stab', 'pierced': 'Stab',
     'skewer': 'Stab', 'skewered': 'Stab', 'impale': 'Stab', 'impaled': 'Stab',
 }
 
 INCOMING_VERB_RE = re.compile(
     r'(hits|damages|slashes|stabs|bites|claws|burns|zaps|smashes|crushes|'
-    r'strikes|blasts|freezes|shocks|drowns|staggers|cuts|pierces|impales)\s+you', re.I)
+    r'strikes|blasts|freezes|shocks|drowns|staggers|cuts|pierces|impales|grazed)\s+you', re.I)
 INCOMING_VERBS = {
     'hits': 'Smash', 'damages': 'Smash', 'strikes': 'Smash', 'blasts': 'Smash',
     'smashes': 'Smash', 'crushes': 'Smash', 'drowns': 'Smash', 'staggers': 'Smash',
+    'grazed': 'Smash',
     'slashes': 'Cut', 'cuts': 'Cut', 'claws': 'Cut',
     'stabs': 'Stab', 'pierces': 'Stab', 'impales': 'Stab', 'bites': 'Stab',
     'burns': 'Fire', 'zaps': 'Shock', 'shocks': 'Shock', 'freezes': 'Cold',
@@ -70,7 +76,8 @@ NEARLY_CUT_RE = re.compile(r'nearly cut.*in half', re.I)
 
 TYPE_COLORS = {
     'Shock': '#87ceeb', 'Fire': '#ff6347', 'Cold': '#add8e6',
-    'Acid': '#7fff00', 'Death': '#9370db',
+    'Acid': '#7fff00', 'Death': '#9370db', 'Poison': '#00ff7f',
+    'Holy': '#da70d6', 'Magic': '#9966ff',
     'Cut': '#ffa500', 'Smash': '#cd853f', 'Stab': '#daa520',
 }
 
@@ -174,7 +181,6 @@ class DPSTrackerGUI:
         self.sessions = []
         self.last_out_ms = 0
         self.last_in_ms = 0
-        self._seen = set()
         self._shutdown = False
         self._has_message_text = False
         self._out_is_dummy = False  # True when current outgoing session is vs Training Dummy
@@ -189,7 +195,7 @@ class DPSTrackerGUI:
         self.root.title("Wyvern DPS Tracker")
         self.root.attributes('-topmost', True)
         self.root.configure(bg='#0d1117')
-        self.root.geometry('440x700')
+        self.root.geometry('440x820')
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         mono = tkfont.Font(family='Consolas', size=11)
@@ -206,9 +212,9 @@ class DPSTrackerGUI:
         self.out_dps, self.out_stats, self.out_bd = self._build_section(
             "OUTGOING", '#3fb950', big, lbl, sm, mono, breakdown=True)
 
-        # Incoming (no type breakdown — damage comes from HP tracking)
+        # Incoming (with type breakdown — message text paired with HP deltas)
         self.in_dps, self.in_stats, self.in_bd = self._build_section(
-            "INCOMING", '#f85149', big, lbl, sm, mono, breakdown=False)
+            "INCOMING", '#f85149', big, lbl, sm, mono, breakdown=True)
 
         # Timing
         tf = tk.Frame(self.root, bg='#161b22', bd=1, relief='groove')
@@ -396,10 +402,6 @@ class DPSTrackerGUI:
             elif self._has_message_text:
                 return  # skip legacy events without text
 
-            if ('out', ts, dmg) in self._seen:
-                return
-            self._seen.add(('out', ts, dmg))
-
             cat = categorize_outgoing(msg)
             is_dummy = 'Training Dummy' in msg
 
@@ -420,24 +422,25 @@ class DPSTrackerGUI:
             self.status.config(text="Tracking...", fg='#3fb950')
 
         elif etype == "IN":
+            parts = data.split('|', 1)
             try:
-                dmg = int(data.split('|', 1)[0])
+                dmg = int(parts[0])
             except ValueError:
                 return
             if dmg <= 0:
                 return
+            msg = parts[1] if len(parts) > 1 else ""
 
-            if ('in', ts, dmg) in self._seen:
-                return
-            self._seen.add(('in', ts, dmg))
+            cat = categorize_incoming(msg) if msg else 'Unknown'
 
             if not self.in_session or not self.in_session.active:
                 self._start('in')
-            self.in_session.add_hit(ts, dmg)
+            self.in_session.add_hit(ts, dmg, cat)
             self.last_in_ms = ts
 
             elapsed = (ts - self.in_session.start_ms) / 1000.0
-            self._log(f"   IN {elapsed:6.2f}s {dmg:>5d}", 'in')
+            cat_tag = f" [{cat}]" if msg else ""
+            self._log(f"   IN {elapsed:6.2f}s {dmg:>5d}{cat_tag}", 'in')
 
         elif etype == "KILL":
             self._log(f"  KILL  {data}", 'kill')
@@ -453,10 +456,6 @@ class DPSTrackerGUI:
                 self._end('out')
             if self.in_session and self.in_session.active:
                 self._end('in')
-
-        # Cap dedup set
-        if len(self._seen) > 10000:
-            self._seen.clear()
 
     # -- Log reader --
 
@@ -506,7 +505,6 @@ class DPSTrackerGUI:
         self.in_session = None
         self.last_out_ms = 0
         self.last_in_ms = 0
-        self._seen.clear()
         self._out_is_dummy = False
         self.log.config(state=tk.NORMAL)
         self.log.delete('1.0', tk.END)

@@ -48,13 +48,9 @@ OUTGOING_VERBS = {
     'smash': 'Smash', 'smashed': 'Smash', 'crush': 'Smash', 'crushed': 'Smash',
     'slam': 'Smash', 'slammed': 'Smash', 'bash': 'Smash', 'bashed': 'Smash',
     'pummel': 'Smash', 'pummeled': 'Smash', 'smote': 'Smash', 'smite': 'Smash',
-    'drown': 'Smash', 'drowned': 'Smash', 'stagger': 'Smash', 'staggered': 'Smash',
+    'stagger': 'Smash', 'staggered': 'Smash',
     'hit': 'Smash', 'strike': 'Smash', 'struck': 'Smash', 'graze': 'Smash', 'grazed': 'Smash',
-    'blast': 'Smash', 'blasted': 'Smash', 'zap': 'Smash', 'zapped': 'Smash',
-    'overwhelm': 'Smash', 'overwhelmed': 'Smash', 'engulf': 'Smash', 'engulfed': 'Smash',
-    'scorch': 'Smash', 'scorched': 'Smash', 'shock': 'Smash', 'shocked': 'Smash',
-    'decimate': 'Smash', 'decimated': 'Smash',
-    'condemn': 'Smash', 'condemned': 'Smash',
+    'overwhelm': 'Smash', 'overwhelmed': 'Smash',
     'stab': 'Stab', 'stabbed': 'Stab', 'pierce': 'Stab', 'pierced': 'Stab',
     'skewer': 'Stab', 'skewered': 'Stab', 'impale': 'Stab', 'impaled': 'Stab',
 }
@@ -63,8 +59,10 @@ INCOMING_VERB_RE = re.compile(
     r'(hits|damages|slashes|stabs|bites|claws|burns|zaps|smashes|crushes|'
     r'strikes|blasts|freezes|shocks|drowns|staggers|cuts|pierces|impales|grazed)\s+you', re.I)
 INCOMING_VERBS = {
-    'hits': 'Smash', 'damages': 'Smash', 'strikes': 'Smash', 'blasts': 'Smash',
-    'smashes': 'Smash', 'crushes': 'Smash', 'drowns': 'Smash', 'staggers': 'Smash',
+    'hits': 'Smash', 'damages': 'Smash', 'strikes': 'Smash',
+    'blasts': 'Shock',
+    'smashes': 'Smash', 'crushes': 'Smash', 'staggers': 'Smash',
+    'drowns': 'Water',
     'grazed': 'Smash',
     'slashes': 'Cut', 'cuts': 'Cut', 'claws': 'Cut',
     'stabs': 'Stab', 'pierces': 'Stab', 'impales': 'Stab', 'bites': 'Stab',
@@ -77,7 +75,7 @@ NEARLY_CUT_RE = re.compile(r'nearly cut.*in half', re.I)
 TYPE_COLORS = {
     'Shock': '#87ceeb', 'Fire': '#ff6347', 'Cold': '#add8e6',
     'Acid': '#7fff00', 'Death': '#9370db', 'Poison': '#00ff7f',
-    'Holy': '#da70d6', 'Magic': '#9966ff',
+    'Holy': '#da70d6', 'Magic': '#9966ff', 'Water': '#4169e1',
     'Cut': '#ffa500', 'Smash': '#cd853f', 'Stab': '#daa520',
 }
 
@@ -97,6 +95,13 @@ VERB_TYPES = {
     'burned': 'Fire', 'burn': 'Fire', 'scorched': 'Fire', 'scorch': 'Fire',
     'shocked': 'Shock', 'shock': 'Shock', 'zapped': 'Shock', 'zap': 'Shock',
     'corroded': 'Acid', 'corrode': 'Acid',
+    'drowned': 'Water', 'drown': 'Water',
+    'decimated': 'Holy', 'decimate': 'Holy',
+    'condemned': 'Holy', 'condemn': 'Holy',
+    'blasted': 'Shock', 'blast': 'Shock',
+    'zapped': 'Shock', 'zap': 'Shock',
+    'engulfed': 'Fire', 'engulf': 'Fire',
+    'scorched': 'Fire', 'scorch': 'Fire',
 }
 
 # Extract flavor text: the part after prepositions (with/in) before "for X damage"
@@ -214,6 +219,7 @@ class DPSTrackerGUI:
         self._shutdown = False
         self._has_message_text = False
         self._out_is_dummy = False  # True when current outgoing session is vs Training Dummy
+        self._paused = True  # Start stopped, user clicks Start
 
         self._build_ui()
         self._start_log_reader()
@@ -260,9 +266,12 @@ class DPSTrackerGUI:
             v.pack(side=tk.RIGHT)
             self.time_labels[key] = v
 
-        # Reset button
+        # Controls
         btn_frame = tk.Frame(self.root, bg='#0d1117')
         btn_frame.pack(fill=tk.X, padx=12, pady=2)
+        self.toggle_btn = tk.Button(btn_frame, text="Start", font=sm, bg='#238636', fg='#ffffff',
+                                     bd=0, cursor='hand2', width=8, command=self._toggle_tracking)
+        self.toggle_btn.pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(btn_frame, text="Reset", font=sm, bg='#21262d', fg='#c9d1d9',
                   bd=0, cursor='hand2', width=8, command=self._reset).pack(side=tk.LEFT)
 
@@ -414,13 +423,17 @@ class DPSTrackerGUI:
             return
 
         if etype == "AGENT_READY":
-            self.status.config(text="Agent loaded...", fg='#f0883e')
+            if not self._paused:
+                self.status.config(text="Agent loaded...", fg='#f0883e')
         elif etype == "ATTACHED":
-            self.status.config(text="Attached! Start fighting.", fg='#3fb950')
+            if not self._paused:
+                self.status.config(text="Attached! Start fighting.", fg='#3fb950')
         elif etype == "ERROR":
             self.status.config(text=f"Error: {data}", fg='#f85149')
 
         elif etype in ("OUT", "HIT"):
+            if self._paused:
+                return
             parts = data.split('|', 1)
             try:
                 dmg = int(parts[0])
@@ -452,6 +465,8 @@ class DPSTrackerGUI:
             self.status.config(text="Tracking...", fg='#3fb950')
 
         elif etype == "IN":
+            if self._paused:
+                return
             parts = data.split('|', 1)
             try:
                 dmg = int(parts[0])
@@ -525,8 +540,23 @@ class DPSTrackerGUI:
         self.log.see(tk.END)
         self.log.config(state=tk.DISABLED)
 
+    def _toggle_tracking(self):
+        """Toggle tracking on/off."""
+        self._paused = not self._paused
+        if self._paused:
+            # Stop: end active sessions
+            if self.out_session and self.out_session.active:
+                self._end('out')
+            if self.in_session and self.in_session.active:
+                self._end('in')
+            self.toggle_btn.config(text="Start", bg='#238636')
+            self.status.config(text="Stopped", fg='#f0883e')
+        else:
+            self.toggle_btn.config(text="Stop", bg='#da3633')
+            self.status.config(text="Tracking...", fg='#3fb950')
+
     def _reset(self):
-        """Reset all sessions and clear the log."""
+        """Reset all sessions, clear the log, and stop tracking."""
         if self.out_session and self.out_session.active:
             self._end('out')
         if self.in_session and self.in_session.active:
@@ -536,10 +566,12 @@ class DPSTrackerGUI:
         self.last_out_ms = 0
         self.last_in_ms = 0
         self._out_is_dummy = False
+        self._paused = True
+        self.toggle_btn.config(text="Start", bg='#238636')
         self.log.config(state=tk.NORMAL)
         self.log.delete('1.0', tk.END)
         self.log.config(state=tk.DISABLED)
-        self.status.config(text="Reset. Start fighting.", fg='#3fb950')
+        self.status.config(text="Reset. Press Start.", fg='#f0883e')
 
     def _on_close(self):
         self._shutdown = True

@@ -19,6 +19,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from pynput import keyboard as kb
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 LOG_FILE = SCRIPT_DIR / "dps_events_v2.log"
@@ -233,6 +234,13 @@ class DPSTrackerGUI:
         self.root.configure(bg='#0d1117')
         self.root.geometry('440x820')
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Global F12 hotkey (works even when game is focused)
+        def _on_key(key):
+            if key == kb.Key.f12:
+                self.root.after(0, self._toggle_tracking)
+        self._hotkey_listener = kb.Listener(on_press=_on_key)
+        self._hotkey_listener.daemon = True
+        self._hotkey_listener.start()
 
         mono = tkfont.Font(family='Consolas', size=11)
         big = tkfont.Font(family='Consolas', size=28, weight='bold')
@@ -269,7 +277,7 @@ class DPSTrackerGUI:
         # Controls
         btn_frame = tk.Frame(self.root, bg='#0d1117')
         btn_frame.pack(fill=tk.X, padx=12, pady=2)
-        self.toggle_btn = tk.Button(btn_frame, text="Start", font=sm, bg='#238636', fg='#ffffff',
+        self.toggle_btn = tk.Button(btn_frame, text="Start (F12)", font=sm, bg='#238636', fg='#ffffff',
                                      bd=0, cursor='hand2', width=8, command=self._toggle_tracking)
         self.toggle_btn.pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(btn_frame, text="Reset", font=sm, bg='#21262d', fg='#c9d1d9',
@@ -549,10 +557,10 @@ class DPSTrackerGUI:
                 self._end('out')
             if self.in_session and self.in_session.active:
                 self._end('in')
-            self.toggle_btn.config(text="Start", bg='#238636')
+            self.toggle_btn.config(text="Start (F12)", bg='#238636')
             self.status.config(text="Stopped", fg='#f0883e')
         else:
-            self.toggle_btn.config(text="Stop", bg='#da3633')
+            self.toggle_btn.config(text="Stop (F12)", bg='#da3633')
             self.status.config(text="Tracking...", fg='#3fb950')
 
     def _reset(self):
@@ -567,7 +575,7 @@ class DPSTrackerGUI:
         self.last_in_ms = 0
         self._out_is_dummy = False
         self._paused = True
-        self.toggle_btn.config(text="Start", bg='#238636')
+        self.toggle_btn.config(text="Start (F12)", bg='#238636')
         self.log.config(state=tk.NORMAL)
         self.log.delete('1.0', tk.END)
         self.log.config(state=tk.DISABLED)

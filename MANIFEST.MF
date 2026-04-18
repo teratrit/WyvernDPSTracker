@@ -1,3 +1,1 @@
-Agent-Class: dps21.DPSAgent
-Can-Retransform-Classes: false
-Can-Redefine-Classes: false
+Agent-Class: dps28.DPSAgent

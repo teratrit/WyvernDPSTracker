@@ -7,3 +7,6 @@ build/
 dist/dps_events*
 agent_v*.jar
 test_*.log
+agent_*.jar
+out_dps*/
+agent_new.jar

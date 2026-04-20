@@ -593,11 +593,52 @@ class DPSTrackerGUI:
                 self._end_session('in')
             self.toggle_btn.config(text="Start (F12)", bg='#238636')
             self.status.config(text="Stopped", fg='#f0883e')
+            self._print_summary()
         else:
             if self.exp_start_ms == 0:
                 self.exp_start_ms = int(time.time() * 1000)
             self.toggle_btn.config(text="Stop (F12)", bg='#da3633')
             self.status.config(text="Tracking...", fg='#3fb950')
+
+    def _print_summary(self):
+        now_ms = int(time.time() * 1000)
+        elapsed_s = (now_ms - self.exp_start_ms) / 1000 if self.exp_start_ms else 0
+        m, s = divmod(int(elapsed_s), 60)
+        h, m = divmod(m, 60)
+        dur = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+        self._log("", 'info')
+        self._log("─" * 52, 'info')
+        self._log(f" SESSION SUMMARY — {dur}", 'kill')
+        self._log("─" * 52, 'info')
+
+        # EXP block
+        if self.exp_total > 0:
+            xp_hr     = self.exp_total * 3600 / elapsed_s if elapsed_s > 0 else 0
+            xp_per_k  = self.exp_total / self.kill_count if self.kill_count else 0
+            self._log(f"  XP          {self.exp_total:>10,}", 'out')
+            self._log(f"  XP/hr       {xp_hr:>10,.0f}",    'out')
+            self._log(f"  Kills       {self.kill_count:>10,}", 'out')
+            if self.kill_count:
+                self._log(f"  XP / kill   {xp_per_k:>10,.0f}", 'out')
+
+        # Outgoing damage
+        if self.out_session and self.out_session.count:
+            s = self.out_session
+            self._log(f"  OUT dmg     {s.total:>10,}  ({s.count} hits, {s.dps:.1f} DPS)", 'out')
+            cs = s.crit_stats()
+            if cs:
+                self._log(
+                    f"  Crits       {cs['crit_pct']:>9.1f}%  "
+                    f"(avg {cs['crit_avg']:.0f} vs {cs['normal_avg']:.0f}, +{cs['crit_boost']:.0f}%)",
+                    'out')
+
+        # Incoming damage
+        if self.in_session and self.in_session.count:
+            s = self.in_session
+            self._log(f"  IN  dmg     {s.total:>10,}  ({s.count} hits, {s.dps:.1f} DPS)", 'in')
+
+        self._log("─" * 52, 'info')
 
     def _refresh_exp(self):
         # Always use wall clock for the rate so burst kills don't inflate it

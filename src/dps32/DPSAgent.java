@@ -1,4 +1,4 @@
-package dps28;
+package dps32;
 
 import wyvern.client.Client;
 import wyvern.client.GameWindow;
@@ -24,6 +24,8 @@ public class DPSAgent {
         Pattern.compile("for\\s+(\\d+)\\s+damage", Pattern.CASE_INSENSITIVE);
     private static final Pattern KILL_PATTERN =
         Pattern.compile("(?:You killed |You destroy |is destroyed|is dead)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern EXP_PATTERN =
+        Pattern.compile("You receive\\s+(\\d[\\d,]*)\\s+xp", Pattern.CASE_INSENSITIVE);
 
     private static BufferedWriter logWriter;
     private static StyledDocument activeDocument;
@@ -49,7 +51,7 @@ public class DPSAgent {
             dbg.println("java.version=" + System.getProperty("java.version"));
         } catch (Exception ignored) {}
 
-        System.out.println("[DPS] Agent loaded (v28). Log: " + logPath);
+        System.out.println("[DPS] Agent loaded (v32). Log: " + logPath);
 
         // Write any exception to an error file alongside the log so we can always diagnose
         String errPath = logPath + ".err";
@@ -76,7 +78,7 @@ public class DPSAgent {
 
         try {
             logWriter = new BufferedWriter(new FileWriter(logPath, false));
-            writeEvent("AGENT_READY", "v28");
+            writeEvent("AGENT_READY", "v32");
         } catch (IOException e) {
             System.err.println("[DPS] Cannot open log: " + e.getMessage());
             // Write error details so they're visible
@@ -168,7 +170,27 @@ public class DPSAgent {
         activeListener = listener;
         active = true;
         System.out.println("[DPS] Document listener attached (styled)");
-        writeEvent("ATTACHED", "v28");
+        writeEvent("ATTACHED", "v32");
+    }
+
+    /**
+     * Called whenever a fresh HP reading arrives (from the 4.2.2 observer or
+     * the 4.1.3 poll thread). Writes an IN event when HP dropped, pairing it
+     * with a pending red-styled message if one arrived within 500 ms.
+     */
+    private static void onHpReading(int hp) {
+        int prev = lastHp;
+        lastHp = hp;
+        if (prev <= 0 || hp >= prev) return;
+        int dmg = prev - hp;
+        String msg = pendingIncomingMsg;
+        long now = System.currentTimeMillis();
+        if (msg != null && (now - pendingIncomingTs) < 500) {
+            pendingIncomingMsg = null;
+            writeEvent("IN", dmg + "|" + msg);
+        } else {
+            writeEvent("IN", String.valueOf(dmg));
+        }
     }
 
     /**
@@ -200,28 +222,11 @@ public class DPSAgent {
                     return;
                 }
 
-                InvocationHandler handler = new InvocationHandler() {
-                    @Override
-                    public Object invoke(Object proxy, Method method, Object[] args) {
-                        if ("onHpChanged".equals(method.getName()) && args != null && args.length >= 2) {
-                            int hp = (Integer) args[0];
-                            int prev = lastHp;
-                            lastHp = hp;
-                            if (prev > 0 && hp < prev) {
-                                int dmg = prev - hp;
-                                String msg = pendingIncomingMsg;
-                                long msgTs = pendingIncomingTs;
-                                long now = System.currentTimeMillis();
-                                if (msg != null && (now - msgTs) < 500) {
-                                    pendingIncomingMsg = null;
-                                    writeEvent("IN", dmg + "|" + msg);
-                                } else {
-                                    writeEvent("IN", String.valueOf(dmg));
-                                }
-                            }
-                        }
-                        return null;
+                InvocationHandler handler = (proxy, method, args) -> {
+                    if ("onHpChanged".equals(method.getName()) && args != null && args.length >= 2) {
+                        onHpReading((Integer) args[0]);
                     }
+                    return null;
                 };
 
                 statProxy = Proxy.newProxyInstance(
@@ -264,37 +269,28 @@ public class DPSAgent {
 
             final Method getHpMethod = statView.getClass().getMethod("getHp");
 
+            // Resolve the Pair's "current" accessor once — Kotlin Pair exposes
+            // both getFirst() and component1(); pick whichever exists here.
+            Object firstPair = getHpMethod.invoke(statView);
+            if (firstPair == null) {
+                System.err.println("[DPS] getHp() returned null, cannot resolve Pair accessor");
+                return;
+            }
+            Method pairFirst;
+            try {
+                pairFirst = firstPair.getClass().getMethod("getFirst");
+            } catch (NoSuchMethodException e) {
+                pairFirst = firstPair.getClass().getMethod("component1");
+            }
+            final Method pairAccessor = pairFirst;
+
             // Poll HP every 200ms in a daemon thread
             Thread hpPoll = new Thread(() -> {
                 while (!Thread.currentThread().isInterrupted() && active) {
                     try {
                         Object hpPair = getHpMethod.invoke(statView);
                         if (hpPair != null) {
-                            // getHp() returns Pair<Integer, Integer> — first = current, second = max
-                            // Pair has .getFirst() / .component1() in Kotlin
-                            int hp = -1;
-                            try {
-                                Method first = hpPair.getClass().getMethod("getFirst");
-                                hp = (Integer) first.invoke(hpPair);
-                            } catch (NoSuchMethodException e) {
-                                // Try Kotlin component1()
-                                Method comp1 = hpPair.getClass().getMethod("component1");
-                                hp = (Integer) comp1.invoke(hpPair);
-                            }
-                            int prev = lastHp;
-                            lastHp = hp;
-                            if (prev > 0 && hp < prev) {
-                                int dmg = prev - hp;
-                                String msg = pendingIncomingMsg;
-                                long msgTs = pendingIncomingTs;
-                                long now = System.currentTimeMillis();
-                                if (msg != null && (now - msgTs) < 500) {
-                                    pendingIncomingMsg = null;
-                                    writeEvent("IN", dmg + "|" + msg);
-                                } else {
-                                    writeEvent("IN", String.valueOf(dmg));
-                                }
-                            }
+                            onHpReading((Integer) pairAccessor.invoke(hpPair));
                         }
                     } catch (Exception e) {
                         // Stop polling if API breaks
@@ -323,6 +319,14 @@ public class DPSAgent {
 
         if (KILL_PATTERN.matcher(line).find()) {
             writeEvent("KILL", line);
+        }
+
+        // EXP gain — check before direction detection so it doesn't fall through
+        Matcher expM = EXP_PATTERN.matcher(line);
+        if (expM.find()) {
+            String xp = expM.group(1).replace(",", "");
+            writeEvent("EXP", xp);
+            return;
         }
 
         // Direction detection:

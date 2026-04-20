@@ -5,11 +5,13 @@ damage (outgoing and incoming) with millisecond timestamps and per-type breakdow
 """
 
 import atexit
+import ctypes
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -61,18 +63,20 @@ PHYSICAL_VERBS = {
     'impale':    'Stab',  'impaled':   'Stab',
 }
 
-# Incoming verbs
-INCOMING_VERB_RE = re.compile(
-    r'(hits|damages|slashes|stabs|bites|claws|burns|zaps|smashes|crushes|'
-    r'strikes|blasts|freezes|shocks|drowns|staggers|cuts|pierces|impales|graze[sd]?)\s+you', re.I)
+# Incoming verbs — map of verb → damage type
 INCOMING_VERBS = {
     'hits':    'Smash', 'damages': 'Smash', 'strikes': 'Smash',
-    'smashes': 'Smash', 'crushes': 'Smash', 'staggers':'Smash', 'graze':   'Smash', 'grazes':  'Smash', 'grazed':  'Smash',
+    'smashes': 'Smash', 'crushes': 'Smash', 'staggers':'Smash',
+    'graze':   'Smash', 'grazes':  'Smash', 'grazed':  'Smash',
     'slashes': 'Cut',   'cuts':    'Cut',   'claws':   'Cut',
     'stabs':   'Stab',  'pierces': 'Stab',  'impales': 'Stab',  'bites':   'Stab',
     'burns':   'Fire',  'zaps':    'Shock', 'shocks':  'Shock', 'freezes': 'Cold',
     'blasts':  'Shock', 'drowns':  'Water',
 }
+# Regex derived from the dict so the two stay in sync automatically.
+INCOMING_VERB_RE = re.compile(
+    r'(' + '|'.join(sorted(INCOMING_VERBS, key=len, reverse=True)) + r')\s+you',
+    re.I)
 
 # Element keyword patterns — used for flavor-text scan (outgoing) and full-msg scan (incoming)
 # Note: no \bice\b or \bfrozen\b to avoid matching monster names in incoming messages
@@ -92,6 +96,7 @@ ELEMENT_PATTERNS = [
 FLAVOR_RE     = re.compile(r'\b(?:with|in)\s+(.+?)\s+for\s+\d+\s+damage', re.I)
 HOLE_RE       = re.compile(r'make a hole|daylight through', re.I)
 NEARLY_CUT_RE = re.compile(r'nearly cut.*in half', re.I)
+MAGIC_RE      = re.compile(r"'s spirit\b|\brend\b", re.I)
 
 TYPE_COLORS = {
     'Shock':  '#87ceeb', 'Fire':   '#ff6347', 'Cold':   '#add8e6',
@@ -124,7 +129,7 @@ def categorize_outgoing(msg):
         if elem:
             return elem
     # 3. Magic markers
-    if re.search(r"'s spirit\b", msg, re.I) or re.search(r'\brend\b', msg, re.I):
+    if MAGIC_RE.search(msg):
         return 'Magic'
     # 4. Physical verb fallback
     if HOLE_RE.search(msg):
@@ -472,7 +477,7 @@ class DPSTrackerGUI:
         elif etype == "ERROR":
             self.status.config(text=f"Error: {data}", fg='#f85149')
 
-        elif etype in ("OUT", "HIT"):
+        elif etype == "OUT":
             if self._paused:
                 return
             parts = data.split('|', 1)
@@ -600,9 +605,22 @@ class DPSTrackerGUI:
             self.toggle_btn.config(text="Stop (F12)", bg='#da3633')
             self.status.config(text="Tracking...", fg='#3fb950')
 
+    def _xp_elapsed_s(self):
+        """Wall-clock seconds since XP tracking began (0 if not started)."""
+        if not self.exp_start_ms:
+            return 0
+        return (int(time.time() * 1000) - self.exp_start_ms) / 1000
+
+    def _xp_rate(self, elapsed_s=None):
+        """XP/hr over the session; 0 if not enough data."""
+        if elapsed_s is None:
+            elapsed_s = self._xp_elapsed_s()
+        if elapsed_s <= 0 or self.exp_total <= 0:
+            return 0
+        return self.exp_total * 3600 / elapsed_s
+
     def _print_summary(self):
-        now_ms = int(time.time() * 1000)
-        elapsed_s = (now_ms - self.exp_start_ms) / 1000 if self.exp_start_ms else 0
+        elapsed_s = self._xp_elapsed_s()
         m, s = divmod(int(elapsed_s), 60)
         h, m = divmod(m, 60)
         dur = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
@@ -614,10 +632,9 @@ class DPSTrackerGUI:
 
         # EXP block
         if self.exp_total > 0:
-            xp_hr     = self.exp_total * 3600 / elapsed_s if elapsed_s > 0 else 0
             xp_per_k  = self.exp_total / self.kill_count if self.kill_count else 0
             self._log(f"  XP          {self.exp_total:>10,}", 'out')
-            self._log(f"  XP/hr       {xp_hr:>10,.0f}",    'out')
+            self._log(f"  XP/hr       {self._xp_rate(elapsed_s):>10,.0f}", 'out')
             self._log(f"  Kills       {self.kill_count:>10,}", 'out')
             if self.kill_count:
                 self._log(f"  XP / kill   {xp_per_k:>10,.0f}", 'out')
@@ -641,21 +658,19 @@ class DPSTrackerGUI:
         self._log("─" * 52, 'info')
 
     def _refresh_exp(self):
-        # Always use wall clock for the rate so burst kills don't inflate it
-        now_ms = int(time.time() * 1000)
         self.exp_labels["Total XP"].config(text=f"{self.exp_total:,}")
         self.exp_labels["Kills"].config(text=str(self.kill_count))
-        if self.exp_total > 0 and self.exp_start_ms > 0:
-            elapsed_s = (now_ms - self.exp_start_ms) / 1000
-            # Don't report a rate until tracking has run for at least 10 seconds
-            if elapsed_s < 10:
-                self.exp_rate_lbl.config(text="… XP/hr", fg='#7d8590')
-            else:
-                rate = self.exp_total * 3600 / elapsed_s
-                self.exp_rate_lbl.config(
-                    text=f"{rate:,.0f} XP/hr", fg='#d2a8ff')
-        else:
+        if self.exp_total <= 0 or not self.exp_start_ms:
             self.exp_rate_lbl.config(text="— XP/hr", fg='#484f58')
+            return
+        elapsed_s = self._xp_elapsed_s()
+        # Don't report a rate until tracking has run for at least 10 seconds —
+        # prevents burst kills in the first few seconds from spiking the rate.
+        if elapsed_s < 10:
+            self.exp_rate_lbl.config(text="… XP/hr", fg='#7d8590')
+        else:
+            self.exp_rate_lbl.config(
+                text=f"{self._xp_rate(elapsed_s):,.0f} XP/hr", fg='#d2a8ff')
 
     def _reset(self):
         if self.out_session and self.out_session.active:
@@ -746,13 +761,11 @@ def attach_agent():
     res, run = _res_dir(), _run_dir()
     # Copy agent.jar to a unique name so the JVM doesn't use a cached class loader
     # from a previous load in the same session.
-    import shutil as _shutil
     agent_src  = res / "agent.jar"
     agent_copy = run / f"agent_{int(time.time())}.jar"
-    _shutil.copy2(str(agent_src), str(agent_copy))
+    shutil.copy2(str(agent_src), str(agent_copy))
     agent = str(agent_copy)
-    from datetime import datetime as _dt
-    ts_str = _dt.now().strftime("%Y%m%d_%H%M%S")
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     log    = str(run / f"dps_events_{ts_str}.log")
 
     global LOG_FILE
@@ -788,7 +801,6 @@ def attach_agent():
 def main():
     print("=== Wyvern DPS Tracker ===\n")
 
-    import ctypes
     ctypes.windll.kernel32.CreateMutexW(None, True, "WyvernDPSTracker_SingleInstance")
     if ctypes.windll.kernel32.GetLastError() == 183:
         print("Another DPS Tracker is already running!")
@@ -807,7 +819,7 @@ def main():
             print(f"\n  >> Java found: {java}")
         if isinstance(result, str):
             print(f"\n  >> Attach output:\n{result}")
-        # Check for agent error file (written by dps24+ on agentmain crash)
+        # Check for agent error file (written on agentmain crash)
         err_file = LOG_FILE.parent / (LOG_FILE.name + ".err")
         if err_file.exists():
             try:
@@ -815,8 +827,7 @@ def main():
             except Exception:
                 pass
         # Also check the guaranteed-writable tmp debug file
-        import tempfile as _tmp
-        tmp_dbg = Path(_tmp.gettempdir()) / "dps_agent_debug.txt"
+        tmp_dbg = Path(tempfile.gettempdir()) / "dps_agent_debug.txt"
         if tmp_dbg.exists():
             try:
                 print(f"\n  >> Agent debug ({tmp_dbg}):\n{tmp_dbg.read_text()}")

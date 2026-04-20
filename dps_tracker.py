@@ -236,6 +236,9 @@ class DPSTrackerGUI:
         self.last_in_ms    = 0
         self._out_dummy    = False
         self._paused       = True
+        self.exp_total     = 0
+        self.exp_start_ms  = 0
+        self.kill_count    = 0
         self._shutdown   = False
         self._build_ui()
         self._start_log_reader()
@@ -281,6 +284,27 @@ class DPSTrackerGUI:
             v = tk.Label(row, text="—", fg='#c9d1d9', bg='#161b22', font=sm, anchor='e')
             v.pack(side=tk.RIGHT)
             self.time_labels[key] = v
+
+        # EXP tracker
+        ef = tk.Frame(self.root, bg='#0d1117')
+        ef.pack(fill=tk.X, padx=12, pady=(4, 0))
+        tk.Label(ef, text="EXP", fg='#d2a8ff', bg='#0d1117',
+                 font=lbl, anchor='w').pack(side=tk.LEFT)
+        self.exp_rate_lbl = tk.Label(ef, text="— XP/hr", fg='#484f58',
+                                     bg='#0d1117', font=big, anchor='e')
+        self.exp_rate_lbl.pack(side=tk.RIGHT)
+
+        erf = tk.Frame(self.root, bg='#161b22', bd=1, relief='groove')
+        erf.pack(fill=tk.X, padx=12, pady=2)
+        self.exp_labels = {}
+        for key in ("Total XP", "Kills"):
+            row = tk.Frame(erf, bg='#161b22')
+            row.pack(fill=tk.X, padx=8)
+            tk.Label(row, text=key, fg='#7d8590', bg='#161b22',
+                     font=sm, width=8, anchor='w').pack(side=tk.LEFT)
+            v = tk.Label(row, text="0", fg='#c9d1d9', bg='#161b22', font=sm, anchor='e')
+            v.pack(side=tk.RIGHT)
+            self.exp_labels[key] = v
 
         # Controls
         bf = tk.Frame(self.root, bg='#0d1117')
@@ -355,6 +379,7 @@ class DPSTrackerGUI:
 
         self._refresh(self.out_session, self.out_dps, self.out_stats, self.out_bd, '#3fb950', '#58a6ff')
         self._refresh(self.in_session,  self.in_dps,  self.in_stats,  self.in_bd,  '#f85149', '#d29922')
+        self._refresh_exp()
 
         starts = [s.start_ms for s in (self.out_session, self.in_session) if s and s.start_ms]
         if starts:
@@ -438,6 +463,10 @@ class DPSTrackerGUI:
             self.status.config(text="Agent loaded...", fg='#f0883e')
         elif etype == "ATTACHED":
             self._paused = False
+            # Only init on first attach — re-attach must preserve accumulated
+            # exp_total so the rate stays anchored to the session's actual start
+            if self.exp_start_ms == 0:
+                self.exp_start_ms = int(time.time() * 1000)
             self.toggle_btn.config(text="Stop (F12)", bg='#da3633')
             self.status.config(text="Tracking...", fg='#3fb950')
         elif etype == "ERROR":
@@ -488,11 +517,27 @@ class DPSTrackerGUI:
             self._log(f"   IN {elapsed:6.2f}s {dmg:>5d}{cat_tag}", 'in')
 
         elif etype == "KILL":
+            if not self._paused:
+                self.kill_count += 1
+                self._refresh_exp()
             self._log(f"  KILL  {data}", 'kill')
             if 'Training Dummy' in data:
                 if self.out_session and self.out_session.active:
                     self._end_session('out')
                 self._out_dummy = False
+
+        elif etype == "EXP":
+            if self._paused:
+                return
+            try:
+                xp = int(data)
+            except ValueError:
+                return
+            if self.exp_start_ms == 0:
+                self.exp_start_ms = int(time.time() * 1000)
+            self.exp_total += xp
+            self._log(f"  EXP  +{xp:,}", 'info')
+            self._refresh_exp()
 
         elif etype == "DEATH":
             self._log("  DIED", 'in')
@@ -549,20 +594,45 @@ class DPSTrackerGUI:
             self.toggle_btn.config(text="Start (F12)", bg='#238636')
             self.status.config(text="Stopped", fg='#f0883e')
         else:
+            if self.exp_start_ms == 0:
+                self.exp_start_ms = int(time.time() * 1000)
             self.toggle_btn.config(text="Stop (F12)", bg='#da3633')
             self.status.config(text="Tracking...", fg='#3fb950')
+
+    def _refresh_exp(self):
+        # Always use wall clock for the rate so burst kills don't inflate it
+        now_ms = int(time.time() * 1000)
+        self.exp_labels["Total XP"].config(text=f"{self.exp_total:,}")
+        self.exp_labels["Kills"].config(text=str(self.kill_count))
+        if self.exp_total > 0 and self.exp_start_ms > 0:
+            elapsed_s = (now_ms - self.exp_start_ms) / 1000
+            # Don't report a rate until tracking has run for at least 10 seconds
+            if elapsed_s < 10:
+                self.exp_rate_lbl.config(text="… XP/hr", fg='#7d8590')
+            else:
+                rate = self.exp_total * 3600 / elapsed_s
+                self.exp_rate_lbl.config(
+                    text=f"{rate:,.0f} XP/hr", fg='#d2a8ff')
+        else:
+            self.exp_rate_lbl.config(text="— XP/hr", fg='#484f58')
 
     def _reset(self):
         if self.out_session and self.out_session.active:
             self._end_session('out')
         if self.in_session and self.in_session.active:
             self._end_session('in')
-        self.out_session = None
-        self.in_session  = None
-        self.last_out_ms = 0
-        self.last_in_ms  = 0
-        self._out_dummy  = False
-        self._paused     = True
+        self.out_session   = None
+        self.in_session    = None
+        self.last_out_ms   = 0
+        self.last_in_ms    = 0
+        self._out_dummy    = False
+        self._paused       = True
+        self.exp_total     = 0
+        self.exp_start_ms  = 0
+        self.kill_count    = 0
+        self.exp_labels["Total XP"].config(text="0")
+        self.exp_labels["Kills"].config(text="0")
+        self.exp_rate_lbl.config(text="— XP/hr", fg='#484f58')
         self.toggle_btn.config(text="Start (F12)", bg='#238636')
         self.log.config(state=tk.NORMAL)
         self.log.delete('1.0', tk.END)

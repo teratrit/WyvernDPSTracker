@@ -24,6 +24,7 @@ from pynput import keyboard as kb
 
 SCRIPT_DIR  = Path(__file__).parent.resolve()
 LOG_FILE    = SCRIPT_DIR / "dps_events_v2.log"
+GAME_PID    = 0   # PID of the Wyvern JVM we're attached to; 0 = unknown
 SESSION_GAP = 15  # seconds of inactivity before session auto-ends
 
 # ── Damage categorization ─────────────────────────────────────────────────────
@@ -335,6 +336,20 @@ class DPSTrackerGUI:
             self.log.tag_configure(tag, foreground=fg)
 
         self._tick()
+        self._poll_game_alive()
+
+    def _poll_game_alive(self):
+        """Close ourselves when the Wyvern JVM exits."""
+        if self._shutdown:
+            return
+        if GAME_PID and not _pid_alive(GAME_PID):
+            # Print a final summary so the user sees their session before we close
+            if not self._paused:
+                self._print_summary()
+            self.status.config(text="Wyvern closed. Exiting...", fg='#f0883e')
+            self.root.after(1500, self._on_close)
+            return
+        self.root.after(2000, self._poll_game_alive)
 
     def _build_section(self, title, color, big, lbl, sm, extra_stats=None):
         hdr = tk.Frame(self.root, bg='#0d1117')
@@ -761,6 +776,26 @@ def find_java():
     return None
 
 
+def _pid_alive(pid):
+    """Windows-only: check if a process with the given PID is still running."""
+    if not pid:
+        return True  # Unknown PID — be permissive, don't self-close
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    handle = ctypes.windll.kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        exit_code = ctypes.c_ulong()
+        if ctypes.windll.kernel32.GetExitCodeProcess(
+                handle, ctypes.byref(exit_code)):
+            return exit_code.value == STILL_ACTIVE
+        return False
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
 def attach_agent():
     java = find_java()
     if not java:
@@ -796,6 +831,12 @@ def attach_agent():
         agent_copy.unlink(missing_ok=True)
     except Exception:
         pass
+
+    # Parse the game PID so we can monitor when Wyvern exits and close ourselves.
+    global GAME_PID
+    pid_match = re.search(r'Attaching to PID (\d+):', r.stdout or "")
+    if pid_match:
+        GAME_PID = int(pid_match.group(1))
 
     # If a live agent from a previous launch is still attached, the attacher
     # prints "EXISTING:<logpath>" and skips injection. Adopt that log file

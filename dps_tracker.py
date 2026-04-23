@@ -400,7 +400,17 @@ class DPSTrackerGUI:
 
     def _refresh(self, session, dps_lbl, stats, bd, hi_color, mid_color):
         if not session or session.count == 0:
+            # Clear every stat so stale numbers from a prior session don't leak
+            # into what looks like the current one.
             dps_lbl.config(text="— DPS", fg='#484f58')
+            for key in ("Damage", "Hits", "Avg", "Max"):
+                stats[key].config(text="0")
+            if "Crit %" in stats:
+                for key in ("Normal", "Crit Avg", "Crit %", "Crit Boost"):
+                    stats[key].config(text="—")
+            bd.config(state=tk.NORMAL)
+            bd.delete('1.0', tk.END)
+            bd.config(state=tk.DISABLED)
             return
         dps = session.dps
         dps_lbl.config(

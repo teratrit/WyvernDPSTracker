@@ -89,6 +89,10 @@ public class DPSAgent {
             return;
         }
 
+        // Advertise this agent's log path via a system property so a later
+        // tracker launch can detect us and reuse rather than double-injecting.
+        System.setProperty("dps.tracker.logpath", logPath);
+
         String lockPath = logPath + ".lock";
         try { new File(lockPath).createNewFile(); } catch (IOException ignored) {}
 
@@ -378,6 +382,8 @@ public class DPSAgent {
         statProxy = null;
         lastHp = -1;
         pendingIncomingMsg = null;
+        // Clear the liveness marker so a later attacher sees accurate state.
+        try { System.clearProperty("dps.tracker.logpath"); } catch (Exception ignored) {}
     }
 
     private static void startWatchThread(String lockPath) {

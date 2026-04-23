@@ -50,6 +50,19 @@ public class DPSAttacher {
         System.out.println("Attaching to PID " + target.id() + ": " + target.displayName());
         VirtualMachine vm = VirtualMachine.attach(target);
         try {
+            // Before injecting, check whether a prior DPS agent is still active
+            // in the target JVM. If so, print its log path and skip injection —
+            // this prevents duplicate listeners after Python was killed hard.
+            java.util.Properties props = vm.getSystemProperties();
+            String existing = props.getProperty("dps.tracker.logpath");
+            if (existing != null && existing.length() > 0) {
+                java.io.File logFile  = new java.io.File(existing);
+                java.io.File lockFile = new java.io.File(existing + ".lock");
+                if (logFile.exists() && lockFile.exists()) {
+                    System.out.println("EXISTING:" + existing);
+                    return;
+                }
+            }
             vm.loadAgent(agentJar, logPath);
             System.out.println("Agent loaded.");
         } finally {

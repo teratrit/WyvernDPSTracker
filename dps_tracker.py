@@ -796,6 +796,17 @@ def attach_agent():
         agent_copy.unlink(missing_ok=True)
     except Exception:
         pass
+
+    # If a live agent from a previous launch is still attached, the attacher
+    # prints "EXISTING:<logpath>" and skips injection. Adopt that log file
+    # instead of the fresh one we just picked.
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("EXISTING:"):
+            existing = line[len("EXISTING:"):].strip()
+            print(f"Reusing existing agent — log: {existing}")
+            LOG_FILE = Path(existing)
+            return True
+
     if r.returncode != 0:
         time.sleep(1)
         if LOG_FILE.exists():

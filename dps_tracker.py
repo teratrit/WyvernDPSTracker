@@ -159,6 +159,10 @@ HOLE_RE       = re.compile(r'(?:make|made)\s+a\s+hole|daylight through', re.I)
 NEARLY_CUT_RE = re.compile(r'nearly cut.*in half', re.I)
 # "Argentavis tears away at you." — verb separated from "you" by "(away) at"
 TEARS_AT_RE   = re.compile(r'\btears\s+(?:away\s+)?at\s+you\b', re.I)
+# "Apex grizzly bear rived your flesh." / "rives your flesh" — verb + "your flesh"
+RIVES_FLESH_RE = re.compile(r'\brive[ds]?\s+your\s+flesh\b', re.I)
+# "Argentavis rips away flesh with its talons." — verb + (away) + bare "flesh"
+RIPS_FLESH_RE  = re.compile(r'\brips?\s+(?:away\s+)?flesh\b', re.I)
 
 # Incoming "You feel ..." status lines — these ARE real damage:
 #  • "You feel sick." → poison DOT ticking
@@ -245,6 +249,8 @@ def extract_mob_kill(line):
 _INC_HOLE_RE   = re.compile(r'^(.+?)\s+(?:made|make)\s+a\s+hole\s+in\s+you\b', re.I)
 _INC_NEARLY_RE = re.compile(r'^(.+?)\s+nearly\s+cut\s+you\b', re.I)
 _INC_TEARS_RE  = re.compile(r'^(.+?)\s+tears\s+(?:away\s+)?at\s+you\b', re.I)
+_INC_RIVES_RE  = re.compile(r'^(.+?)\s+rive[ds]?\s+your\s+flesh\b', re.I)
+_INC_RIPS_RE   = re.compile(r'^(.+?)\s+rips?\s+(?:away\s+)?flesh\b', re.I)
 
 
 def extract_mob_incoming(msg):
@@ -264,6 +270,12 @@ def extract_mob_incoming(msg):
     if m:
         return m.group(1).strip() or None
     m = _INC_TEARS_RE.match(msg)
+    if m:
+        return m.group(1).strip() or None
+    m = _INC_RIVES_RE.match(msg)
+    if m:
+        return m.group(1).strip() or None
+    m = _INC_RIPS_RE.match(msg)
     if m:
         return m.group(1).strip() or None
     m = INCOMING_VERB_RE.search(msg)
@@ -395,6 +407,10 @@ def categorize_incoming(msg):
         return 'Cut'
     if TEARS_AT_RE.search(msg):
         return 'Cut'  # "Argentavis tears away at you" — claw/talon attack
+    if RIVES_FLESH_RE.search(msg):
+        return 'Cut'  # "Apex grizzly bear rived your flesh."
+    if RIPS_FLESH_RE.search(msg):
+        return 'Cut'  # "Argentavis rips away flesh with its talons."
     # 2. Element keyword scan (full message — kept conservative to avoid
     #    monster-name false positives like "Ice Riagor", "Angel of Death").
     elem = _check_elements(msg)
@@ -693,6 +709,10 @@ def _extract_incoming_verb(msg):
         return 'nearly cut in half'
     if TEARS_AT_RE.search(msg):
         return 'tears at'
+    if RIVES_FLESH_RE.search(msg):
+        return 'rived flesh'
+    if RIPS_FLESH_RE.search(msg):
+        return 'rips flesh'
     m = INCOMING_VERB_RE.search(msg)
     return m.group(1).lower() if m else None
 

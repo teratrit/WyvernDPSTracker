@@ -16,7 +16,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import font as tkfont
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -28,82 +28,307 @@ GAME_PID    = 0   # PID of the Wyvern JVM we're attached to; 0 = unknown
 SESSION_GAP = 15  # seconds of inactivity before session auto-ends
 
 # ── Damage categorization ─────────────────────────────────────────────────────
+#
+# Only patterns for strings actually observed in Wyvern logs are kept here.
+# When a new verb / element flavor shows up in the wild, add it with a
+# comment pointing at the source log or screenshot — never speculate.
 
-# Unambiguous outgoing verb → type (checked first to avoid monster-name false positives)
-VERB_TYPES = {
-    'poisoned': 'Poison', 'poison':   'Poison',
-    'froze':    'Cold',   'freeze':   'Cold',
-    'burned':   'Fire',   'burn':     'Fire',
-    'scorched': 'Fire',   'scorch':   'Fire',
-    'engulfed': 'Fire',   'engulf':   'Fire',
-    'shocked':  'Shock',  'shock':    'Shock',
-    'zapped':   'Shock',  'zap':      'Shock',
-    'blasted':  'Shock',  'blast':    'Shock',
-    'corroded': 'Acid',   'corrode':  'Acid',
-    'drowned':  'Water',  'drown':    'Water',
-    'decimated':'Holy',   'decimate': 'Holy',
-    'condemned':'Holy',   'condemn':  'Holy',
-}
-
-# Physical outgoing verbs — fallback after elemental checks
+# Outgoing physical verbs (first word after "You").
 OUTGOING_VERB_RE = re.compile(r'^You\s+(\w+)', re.I)
 PHYSICAL_VERBS = {
-    'cut':       'Cut',   'slice':     'Cut',   'sliced':    'Cut',
-    'slash':     'Cut',   'slashed':   'Cut',   'carve':     'Cut',
-    'carved':    'Cut',   'cleave':    'Cut',   'cleaved':   'Cut',
-    'hew':       'Cut',   'hewed':     'Cut',
-    'smash':     'Smash', 'smashed':   'Smash', 'crush':     'Smash',
-    'crushed':   'Smash', 'slam':      'Smash', 'slammed':   'Smash',
-    'bash':      'Smash', 'bashed':    'Smash', 'pummel':    'Smash',
-    'pummeled':  'Smash', 'smote':     'Smash', 'smite':     'Smash',
-    'stagger':   'Smash', 'staggered': 'Smash', 'hit':       'Smash',
-    'strike':    'Smash', 'struck':    'Smash', 'graze':     'Smash',
-    'grazed':    'Smash', 'overwhelm': 'Smash', 'overwhelmed':'Smash',
-    'stab':      'Stab',  'stabbed':   'Stab',  'pierce':    'Stab',
-    'pierced':   'Stab',  'skewer':    'Stab',  'skewered':  'Stab',
-    'impale':    'Stab',  'impaled':   'Stab',
+    # Stab — observed vs. Azrael, Water Elemental, grizzly bear
+    'stabbed':  'Stab',
+    'pierced':  'Stab',
+    'skewered': 'Stab',
+    'impaled':  'Stab',
+    'bit':      'Stab',   # "You bit apex grizzly bear for 11 damage."
+    # Cut — observed vs. Azrael, Training Dummy, City Guard
+    'cut':      'Cut',
+    'cleaved':  'Cut',
+    'carved':   'Cut',
+    'hewed':    'Cut',
+    'sliced':   'Cut',  # "You sliced Training Dummy to the bone for 72 damage."
+    # Smash — observed vs. Training Dummy, apex yak, grizzly bear
+    'smashed':   'Smash',
+    'smote':     'Smash',
+    'hit':       'Smash',  # "You hit apex yak hard for 32 damage."
+    'staggered': 'Smash',  # "You staggered apex grizzly bear with a tremendous blow ..."
 }
 
-# Incoming verbs — map of verb → damage type
-INCOMING_VERBS = {
-    'hits':    'Smash', 'damages': 'Smash', 'strikes': 'Smash',
-    'smashes': 'Smash', 'crushes': 'Smash', 'staggers':'Smash',
-    'graze':   'Smash', 'grazes':  'Smash', 'grazed':  'Smash',
-    'slashes': 'Cut',   'cuts':    'Cut',   'claws':   'Cut',
-    'stabs':   'Stab',  'pierces': 'Stab',  'impales': 'Stab',  'bites':   'Stab',
-    'burns':   'Fire',  'zaps':    'Shock', 'shocks':  'Shock', 'freezes': 'Cold',
-    'blasts':  'Shock', 'drowns':  'Water',
+# Outgoing element verbs — used AFTER FLAVOR_RE in categorize_outgoing.
+# Only verbs that always map to a single element are here. Ambiguous verbs
+# ('engulfed' can be Fire OR Holy, 'blasted' can be Shock/Cold/Holy) are
+# deliberately omitted — flavor handles them via FLAVOR_RE which runs first.
+ELEMENT_VERBS = {
+    'shocked':       'Shock',  # "You shocked Training Dummy very badly for 58 damage."
+    'zapped':        'Shock',  # "You zapped X with an energy surge for 80 damage."
+    'burned':        'Fire',   # "You burned Training Dummy badly for 31 damage."
+    'scorched':      'Fire',   # "You scorched X horribly with intense flame for 87 damage."
+    'froze':         'Cold',   # "You froze Training Dummy for 17 damage."
+    'covered':       'Cold',   # "You covered X in biting frost for 41 damage."
+    'poisoned':      'Poison', # "You poisoned Training Dummy badly for 21 damage."
+    'corroded':      'Acid',   # "You corroded Training Dummy very badly for 41 damage."
+    'disintegrated': 'Acid',   # "You disintegrated X with a wave of acid for 88 damage."
+    'decimated':     'Holy',   # "You decimated X with your astonishing divinity for 192 damage."
+    'condemned':     'Holy',   # "You condemned X with your brilliant radiance for 80 damage."
+    'overwhelmed':   'Holy',   # "You overwhelmed X with your holy power for 38 damage."
 }
-# Regex derived from the dict so the two stay in sync automatically.
+
+# Incoming verbs observed in real logs. Both past-tense and present-tense
+# forms appear in Wyvern (e.g. "Wolverine bit you", "Argentavis shreds you").
+INCOMING_VERBS = {
+    # Smash
+    'hits':      'Smash',  # "X hits you but does no damage."
+    'hit':       'Smash',
+    'crushed':   'Smash',  # "Caribou crushed your bones in its powerful jaws."
+    'crushes':   'Smash',
+    'smote':     'Smash',  # "Badass lead golem smote you with a godlike wrath."
+    'smashed':   'Smash',
+    'smashes':   'Smash',
+    'staggered': 'Smash',
+    'staggers':  'Smash',
+    'rammed':    'Smash',  # "Musk Ox rammed you with a bone-crushing sound."
+    'rams':      'Smash',
+    'smacked':   'Smash',  # "Badass apex yak smacked you."
+    'smacks':    'Smash',
+    'grazed':    'Smash',  # "Gladiator grazed you."
+    'grazes':    'Smash',
+    # Stab
+    'bit':       'Stab',   # "Wolverine bit you."
+    'bites':     'Stab',
+    'stabbed':   'Stab',   # "Gladiator stabbed you." / "stabbed you deeply."
+    'stabs':     'Stab',
+    'pierced':   'Stab',   # "Gladiator pierced you very deeply."
+    'pierces':   'Stab',
+    # Cut
+    'cut':       'Cut',    # "Frozen Medusa cut you badly."
+    'cuts':      'Cut',
+    'hewed':     'Cut',    # "Gladiator hewed you like an ancient God."
+    'shreds':    'Cut',    # "Argentavis shreds you with savage ferocity."
+    'shred':     'Cut',
+    'clawed':    'Cut',    # "Apex grizzly bear clawed you."
+    'claws':     'Cut',
+    'carved':    'Cut',    # "Gladiator carved you like a butcher."
+    'carves':    'Cut',
+    'sliced':    'Cut',    # "Gladiator sliced you to the bone."
+    'slices':    'Cut',
+    'gashes':    'Cut',    # "Argentavis gashes you deeply."
+    'gashed':    'Cut',
+    # Fire
+    'burned':    'Fire',   # "Dragon breath burned you."
+    'burns':     'Fire',
+    'scorched':  'Fire',
+    'singed':    'Fire',   # "Firefrost singed you."
+    'singes':    'Fire',
+    # Cold
+    'froze':     'Cold',   # "Icestorm froze you."
+    'freezes':   'Cold',
+    'covered':   'Cold',   # "Icestorm covered you in frost."
+    'covers':    'Cold',
+    # Shock
+    'shocked':   'Shock',  # "Thunderstorm shocked you."
+    'shocks':    'Shock',
+    'zapped':    'Shock',
+    'blasted':   'Shock',  # "Thunderstorm blasted you with a huge bolt of lightning."
+    'blasts':    'Shock',  # (default; FLAVOR overrides for arctic/holy)
+    # Acid
+    'slimed':    'Acid',   # "Medusa Archer slimed you."
+    'slimes':    'Acid',
+}
 INCOMING_VERB_RE = re.compile(
     r'(' + '|'.join(sorted(INCOMING_VERBS, key=len, reverse=True)) + r')\s+you',
     re.I)
 
-# Element keyword patterns — used for flavor-text scan (outgoing) and full-msg scan (incoming)
-# Note: no \bice\b or \bfrozen\b to avoid matching monster names in incoming messages
+# Element flavor — keywords scanned in flavor text (outgoing) or full message
+# (incoming). Conservative: only spell-flavor words that are unlikely to appear
+# in monster names. Avoid 'ice', 'cold', 'frozen', 'death' — those collide
+# with mob names like "Ice Riagor", "Frozen Medusa", "Angel of Death".
 ELEMENT_PATTERNS = [
-    (re.compile(r'poison|venom',                                                    re.I), 'Poison'),
-    (re.compile(r'lightning|energy.surge|electr',                                   re.I), 'Shock'),
-    (re.compile(r'flame|burn|fire|inferno|incinerat|scorch|sear|magma|lava|\bhot\b',re.I), 'Fire'),
-    (re.compile(r'arctic|glacial|frost|freeze|froze|chill|blizzard',               re.I), 'Cold'),
-    (re.compile(r'acid|corrosi|dissolv|caustic',                                    re.I), 'Acid'),
-    (re.compile(r'water|drown|flood',                                               re.I), 'Water'),
-    (re.compile(r'death|necrotic|drain|dark.energy|shadow|unholy|wither',          re.I), 'Death'),
-    (re.compile(r'holy|radiance|divinity|divine|vengeance|sacred',                 re.I), 'Holy'),
-    (re.compile(r'spirit|arcane|rend',                                              re.I), 'Magic'),
+    (re.compile(r'\bholy\b|\bradiance\b|\bdivinity\b|\bsacred\b', re.I), 'Holy'),
+    (re.compile(r'\bflame\b|\bfire\b|\bburning\b|\binferno\b',    re.I), 'Fire'),
+    (re.compile(r'\bfrost\b|\bglacial\b|\barctic\b|\bchill\b',    re.I), 'Cold'),
+    (re.compile(r'\blightning\b|\benergy\s+surge\b|\belectr',     re.I), 'Shock'),
+    (re.compile(r'\bacid\b|\bcorrosi',                            re.I), 'Acid'),
 ]
 
-# Extracts flavor text between a preposition ("with"/"in") and "for X damage"
+# Flavor text between "with"/"in" and "for X damage" — feeds ELEMENT_PATTERNS.
 FLAVOR_RE     = re.compile(r'\b(?:with|in)\s+(.+?)\s+for\s+\d+\s+damage', re.I)
-HOLE_RE       = re.compile(r'make a hole|daylight through', re.I)
+# Unambiguous physical patterns — checked BEFORE FLAVOR_RE so that
+# "make a hole in <monster>" doesn't let the monster name leak into flavor.
+HOLE_RE       = re.compile(r'(?:make|made)\s+a\s+hole|daylight through', re.I)
 NEARLY_CUT_RE = re.compile(r'nearly cut.*in half', re.I)
-MAGIC_RE      = re.compile(r"'s spirit\b|\brend\b", re.I)
+# "Argentavis tears away at you." — verb separated from "you" by "(away) at"
+TEARS_AT_RE   = re.compile(r'\btears\s+(?:away\s+)?at\s+you\b', re.I)
+
+# Incoming "You feel ..." status lines — these ARE real damage:
+#  • "You feel sick." → poison DOT ticking
+#  • "You suddenly feel very hot!" → fire-recoil from hitting a fire-aligned mob
+#  • "You suddenly feel very cold!" → cold-recoil from hitting a cold-aligned mob
+FEEL_TYPES = {
+    'sick': 'Poison',
+    'hot':  'Fire',
+    'cold': 'Cold',
+}
+FEEL_RE = re.compile(
+    r'^You\s+(?:suddenly\s+)?feel\s+(?:very\s+)?(' +
+    '|'.join(FEEL_TYPES) + r')\b', re.I)
+
+# ── Mob name extraction ──
+# Strip-based parser: peel off the prefix ("You <verb>", "Justice cleaves", etc.),
+# the "for N damage" tail, and any trailing flavor text. What's left is the mob.
+# Verified to handle 41k+ events across 15 logs with 0 unparsed and no flavor
+# leakage (e.g. "Training Dummy horribly" / "gladiator hard" cases all resolve).
+_DAMAGE_TAIL    = re.compile(r'\s+for\s+\d+\s+damage[!.]?\s*$', re.I)
+_JUSTICE_CLEAVES = re.compile(r'^Justice\s+cleaves\s+', re.I)
+_JUSTICE_RAINS   = re.compile(r'^Justice\s+rains\s+down.+?\s+upon\s+', re.I)
+_YOU_MAKE_HOLE   = re.compile(r'^You\s+make\s+a\s+hole\s+in\s+', re.I)
+_YOU_NEARLY_CUT  = re.compile(r'^You\s+nearly\s+cut\s+', re.I)
+_YOU_VERB        = re.compile(r'^You\s+\w+\s+', re.I)
+_KILL_PREFIX     = re.compile(r'^You\s+(?:killed|destroyed?)\s+', re.I)
+# Flavor tails to strip iteratively from the right — longest patterns first matter
+# inside each `with/in/like/...` group; outer alternatives are mutually exclusive.
+_FLAVOR_TAIL = re.compile(
+    r'\s+(?:'
+    r'with\s+(?:a|an|your|brute|intense|strong|burning|biting|holy|suffocating|savage|deathly|godlike|tremendous|mighty|bone-crushing|astonishing|brilliant).+$'
+    r'|in\s+(?:burning|biting|frost\b).*$'
+    r'|through\s+a\s+vital\s+spot$'
+    r'|like\s+(?:a|an)\s+.+$'
+    r'|to\s+the\s+bone$'
+    r'|so\s+hard.+$'
+    r'|asunder$'
+    r'|very\s+(?:badly|deeply|hard)$'
+    r'|(?:badly|horribly|severely|deeply|hard)$'
+    r')',
+    re.I)
+
+
+def extract_mob_outgoing(msg):
+    """Pull the target mob name from an outgoing damage message. None if not parseable."""
+    s = _DAMAGE_TAIL.sub('', msg)
+    if s == msg:
+        return None  # No "for N damage" — not a damage line
+    if _JUSTICE_CLEAVES.match(s):
+        s = _JUSTICE_CLEAVES.sub('', s)
+        s = re.sub(r'\s+with\s+brute\s+force\s*$', '', s, flags=re.I)
+    elif _JUSTICE_RAINS.match(s):
+        s = _JUSTICE_RAINS.sub('', s)
+    elif _YOU_MAKE_HOLE.match(s):
+        s = _YOU_MAKE_HOLE.sub('', s)
+        s = re.sub(r'\s+so\s+large.*$', '', s, flags=re.I)
+    elif _YOU_NEARLY_CUT.match(s):
+        s = _YOU_NEARLY_CUT.sub('', s)
+        s = re.sub(r'\s+in\s+half\s*$', '', s, flags=re.I)
+    elif _YOU_VERB.match(s):
+        s = _YOU_VERB.sub('', s)
+    else:
+        return None
+    # Iteratively strip flavor from the right
+    while True:
+        new_s = _FLAVOR_TAIL.sub('', s).strip()
+        if new_s == s:
+            break
+        s = new_s
+    return s.strip() or None
+
+
+def extract_mob_kill(line):
+    """Pull the mob name from 'You killed X.' style kill lines."""
+    m = _KILL_PREFIX.match(line)
+    if not m:
+        return None
+    rest = line[m.end():].rstrip('.!').strip()
+    return rest or None
+
+
+# Incoming-mob source extraction. Format is usually "<MOB> <verb> you ..."
+# Special cases handled separately: "X made a hole in you", "X nearly cut you in half".
+_INC_HOLE_RE   = re.compile(r'^(.+?)\s+(?:made|make)\s+a\s+hole\s+in\s+you\b', re.I)
+_INC_NEARLY_RE = re.compile(r'^(.+?)\s+nearly\s+cut\s+you\b', re.I)
+_INC_TEARS_RE  = re.compile(r'^(.+?)\s+tears\s+(?:away\s+)?at\s+you\b', re.I)
+
+
+def extract_mob_incoming(msg):
+    """Pull the source mob from an incoming damage message, if attributable.
+    Returns None for self-effects ('You feel sick'), Justice (player ability),
+    or unparseable lines."""
+    if not msg:
+        return None
+    if FEEL_RE.match(msg):
+        return None  # Self-effect, no mob source
+    if msg.startswith('Justice '):
+        return None  # Player ability, not incoming damage from a mob
+    m = _INC_HOLE_RE.match(msg)
+    if m:
+        return m.group(1).strip() or None
+    m = _INC_NEARLY_RE.match(msg)
+    if m:
+        return m.group(1).strip() or None
+    m = _INC_TEARS_RE.match(msg)
+    if m:
+        return m.group(1).strip() or None
+    m = INCOMING_VERB_RE.search(msg)
+    if m:
+        return msg[:m.start()].strip() or None
+    return None
+
+
+# Wiki monster list — bundled at wyvern_mobs.txt. Used ONLY as a reference
+# indicator in the Mob Stats panel ("is this mob documented on the wiki?").
+# Never used to roll up variants — every distinct name remains its own entry.
+_VARIANT_PREFIXES = {
+    'apex', 'badass', 'huge', 'massive', 'greater', 'lesser',
+    'young', 'ancient', 'arch', 'frozen', 'molten', 'cursed',
+    'corrupted', 'undead', 'demonic', 'shadow',
+}
+
+
+def _load_known_mobs():
+    """Load the canonical mob list from wyvern_mobs.txt if present."""
+    for base in [
+        Path(getattr(sys, '_MEIPASS', '')) if getattr(sys, '_MEIPASS', None) else None,
+        SCRIPT_DIR,
+    ]:
+        if not base:
+            continue
+        path = base / 'wyvern_mobs.txt'
+        if path.exists():
+            try:
+                with open(path, encoding='utf-8') as f:
+                    return {ln.strip() for ln in f if ln.strip()}
+            except OSError:
+                pass
+    return set()
+
+
+KNOWN_MOBS = _load_known_mobs()
+
+
+def is_known_mob(name):
+    """True if `name` (or a prefix-stripped form like 'Banshee' from 'Badass Banshee')
+    is in the wiki list. Cosmetic only — does NOT change how mobs are bucketed.
+    Falls back to title-cased match for lowercase mob names like 'argentavis'."""
+    if not name:
+        return False
+    if name == 'Training Dummy':
+        return True
+    if name in KNOWN_MOBS or name.title() in KNOWN_MOBS:
+        return True
+    words = name.split()
+    while len(words) > 1 and words[0].lower() in _VARIANT_PREFIXES:
+        words = words[1:]
+        candidate = ' '.join(words)
+        if candidate in KNOWN_MOBS or candidate.title() in KNOWN_MOBS:
+            return True
+    return False
 
 TYPE_COLORS = {
-    'Shock':  '#87ceeb', 'Fire':   '#ff6347', 'Cold':   '#add8e6',
-    'Acid':   '#7fff00', 'Death':  '#9370db', 'Poison': '#00ff7f',
-    'Holy':   '#da70d6', 'Magic':  '#9966ff', 'Water':  '#4169e1',
-    'Cut':    '#ffa500', 'Smash':  '#cd853f', 'Stab':   '#daa520',
+    # Elements actually produced by the categorizer:
+    'Shock':   '#87ceeb', 'Fire':    '#ff6347', 'Cold':   '#add8e6',
+    'Poison':  '#00ff7f', 'Holy':    '#da70d6', 'Acid':   '#7fff00',
+    # Physical:
+    'Cut':     '#ffa500', 'Smash':   '#cd853f', 'Stab':   '#daa520',
+    # Weapon ability:
+    'Justice': '#ffd700',
 }
 
 
@@ -117,38 +342,65 @@ def _check_elements(text):
 def categorize_outgoing(msg):
     if not msg:
         return 'Unknown'
-    # 1. Unambiguous verb (avoids monster-name false positives like "Ice Riagor")
-    m = OUTGOING_VERB_RE.match(msg)
-    if m:
-        verb = m.group(1).lower()
-        if verb in VERB_TYPES:
-            return VERB_TYPES[verb]
-    # 2. Element keywords in flavor text only (safe — no monster names after "with/in")
+    # Justice — a weapon ability whose damage line starts with "Justice ..."
+    # (e.g. "Justice cleaves <monster> with brute force for X damage!").
+    # Game renders it in red ("damage") style; the agent already routes these
+    # as OUT events so they count toward the player's damage, not against.
+    if msg.startswith('Justice '):
+        return 'Justice'
+    # 1. Unambiguous physical patterns — MUST come before FLAVOR_RE because
+    #    "make a hole in <monster> ..." would otherwise capture the monster
+    #    name as flavor text and match element keywords in it.
+    if HOLE_RE.search(msg):
+        return 'Stab'
+    if NEARLY_CUT_RE.search(msg):
+        return 'Cut'
+    # 2. Element keywords in flavor text (between "with/in" and "for X damage" —
+    #    safe because monster names don't appear in that slot). Handles
+    #    ambiguous verbs like 'engulfed' / 'blasted' which can be Fire/Cold/
+    #    Holy/Shock depending on the spell flavor.
     flavor = FLAVOR_RE.search(msg)
     if flavor:
         elem = _check_elements(flavor.group(1))
         if elem:
             return elem
-    # 3. Magic markers
-    if MAGIC_RE.search(msg):
-        return 'Magic'
-    # 4. Physical verb fallback
-    if HOLE_RE.search(msg):
-        return 'Stab'
-    if NEARLY_CUT_RE.search(msg):
-        return 'Cut'
+    # 3. Verb-based mapping — element verbs first (single-element verbs that
+    #    don't always carry flavor text), then physical verbs.
+    m = OUTGOING_VERB_RE.match(msg)
     if m:
-        return PHYSICAL_VERBS.get(m.group(1).lower(), 'Unknown')
+        verb = m.group(1).lower()
+        if verb in ELEMENT_VERBS:
+            return ELEMENT_VERBS[verb]
+        if verb in PHYSICAL_VERBS:
+            return PHYSICAL_VERBS[verb]
     return 'Unknown'
 
 
 def categorize_incoming(msg):
     if not msg:
         return 'Unknown'
-    # Full message element scan (incoming messages don't start with player's attack verb)
+    # Justice — defensive: the agent (dps33+) routes Justice lines as OUT,
+    # but old logs may have them tagged as IN. Categorize so they don't
+    # land in the Unknown bucket on replay.
+    if msg.startswith('Justice '):
+        return 'Justice'
+    # "You feel ..." status lines — element-recoil and poison DOT damage.
+    fm = FEEL_RE.match(msg)
+    if fm:
+        return FEEL_TYPES[fm.group(1).lower()]
+    # 1. Unambiguous physical patterns — same protection as outgoing.
+    if HOLE_RE.search(msg):
+        return 'Stab'
+    if NEARLY_CUT_RE.search(msg):
+        return 'Cut'
+    if TEARS_AT_RE.search(msg):
+        return 'Cut'  # "Argentavis tears away at you" — claw/talon attack
+    # 2. Element keyword scan (full message — kept conservative to avoid
+    #    monster-name false positives like "Ice Riagor", "Angel of Death").
     elem = _check_elements(msg)
     if elem:
         return elem
+    # 3. Verb match
     m = INCOMING_VERB_RE.search(msg)
     if m:
         return INCOMING_VERBS.get(m.group(1).lower(), 'Unknown')
@@ -157,6 +409,11 @@ def categorize_incoming(msg):
 
 # ── Session ────────────────────────────────────────────────────────────────────
 
+# Cap on per-session hits buffer. Crit detection is statistical — the most
+# recent few thousand hits are plenty, and capping bounds memory + crit_stats cost.
+HITS_BUFFER_MAX = 5000
+
+
 @dataclass
 class Session:
     start_ms: int  = 0
@@ -164,10 +421,14 @@ class Session:
     total:    int  = 0
     count:    int  = 0
     max_hit:  int  = 0
-    hits:     list = field(default_factory=list)
+    hits:     deque = field(
+        default_factory=lambda: deque(maxlen=HITS_BUFFER_MAX))
     active:   bool = True
     cats:     dict = field(default_factory=lambda: defaultdict(
         lambda: {'damage': 0, 'count': 0, 'max': 0}))
+    # Crit-stats cache, invalidated whenever a new hit is added.
+    _crit_cache:       dict = field(default=None, repr=False, compare=False)
+    _crit_cache_count: int  = field(default=-1,   repr=False, compare=False)
 
     @property
     def elapsed_s(self):
@@ -186,7 +447,16 @@ class Session:
     def crit_stats(self):
         """Auto-detect normal/crit split via 1D k-means (k=2).
         Returns dict with normal_avg, crit_avg, crit_pct, crit_boost
-        or None if there aren't enough distinct hits to split."""
+        or None if there aren't enough distinct hits to split.
+        Cached — recomputed only when new hits land."""
+        if self._crit_cache_count == self.count:
+            return self._crit_cache
+        result = self._compute_crit_stats()
+        self._crit_cache = result
+        self._crit_cache_count = self.count
+        return result
+
+    def _compute_crit_stats(self):
         if self.count < 6:
             return None
         dmg = sorted(d for _, d, _ in self.hits)
@@ -206,13 +476,11 @@ class Session:
         # Require meaningful separation — at least 20% above normal avg
         if high_avg < low_avg * 1.20:
             return None
-        crit_pct   = len(high) / len(dmg) * 100
-        crit_boost = (high_avg - low_avg) / low_avg * 100
         return {
             'normal_avg': low_avg,
             'crit_avg':   high_avg,
-            'crit_pct':   crit_pct,
-            'crit_boost': crit_boost,
+            'crit_pct':   len(high) / len(dmg) * 100,
+            'crit_boost': (high_avg - low_avg) / low_avg * 100,
         }
 
     def add(self, ts, damage, cat='Unknown'):
@@ -226,6 +494,8 @@ class Session:
         c['damage'] += damage
         c['count']  += 1
         c['max']     = max(c['max'], damage)
+        # Invalidate crit cache — next read will recompute.
+        self._crit_cache_count = -1
 
     def finalize(self):
         self.end_ms = self.hits[-1][0] if self.hits else 0
@@ -233,6 +503,199 @@ class Session:
 
 
 # ── GUI ────────────────────────────────────────────────────────────────────────
+
+# Caps on Text widgets to prevent unbounded memory growth on long sessions.
+COMBAT_LOG_MAX_LINES = 1500
+HISTORY_MAX_LINES    = 2000
+
+
+def _trim_text_widget(widget, max_lines):
+    """If the widget has more than max_lines, drop the oldest 20%."""
+    # Tk index '<n>.0' means line n (1-indexed). 'end-1c' is just before
+    # the trailing newline. Counting via index lookup is cheap.
+    line_count = int(widget.index('end-1c').split('.')[0])
+    if line_count > max_lines:
+        drop_to = line_count - int(max_lines * 0.8)
+        widget.delete('1.0', f'{drop_to}.0')
+
+
+def _format_in_types(types_dict, total):
+    """Format the in_types dict as 'Cold 60% / Smash 40%' — top 2 above 5%."""
+    if not types_dict or total <= 0:
+        return '—'
+    items = sorted(types_dict.items(), key=lambda x: -x[1])
+    parts = []
+    for cat, dmg in items[:3]:
+        pct = 100 * dmg / total
+        if pct < 5 and parts:
+            break
+        parts.append(f'{cat} {pct:.0f}%')
+    return ' / '.join(parts) if parts else '—'
+
+
+# Sample-size thresholds for wiki output.
+WIKI_MIN_SAMPLES   = 30   # below this, refuse to emit specific numbers for that stat
+WIKI_LOW_CONF_CAP  = 100  # below this, mark the whole block as low confidence
+WIKI_TOP_N_VERBS   = 8    # cap the per-verb damage breakdown to N most-used verbs
+
+
+def _verb_breakdown_lines(verbs):
+    """Bullet-list lines of '* verb min-max (avg X, n=N)' for verbs with n>=WIKI_MIN_SAMPLES,
+    capped at WIKI_TOP_N_VERBS most frequent."""
+    lines = []
+    sorted_verbs = sorted(verbs.items(), key=lambda x: -x[1]['hits'])
+    skipped = 0
+    for v, vs in sorted_verbs:
+        if vs['hits'] < WIKI_MIN_SAMPLES:
+            skipped += 1
+            continue
+        if len(lines) >= WIKI_TOP_N_VERBS:
+            skipped += 1
+            continue
+        avg = vs['damage_total'] / vs['hits']
+        lines.append(f"* {v} {vs['min']}-{vs['max']} (avg {avg:.0f}, n={vs['hits']})")
+    if skipped > 0:
+        lines.append(f"* <!-- {skipped} more verb(s) below n>=30 threshold or capped -->")
+    return lines
+
+
+def _format_mob_for_wiki(mob, stats):
+    """Render one mob's stats as MediaWiki markup, with sample-size gating.
+
+    Each stat is gated independently: damage range needs ≥30 hits for that verb,
+    HP estimate needs ≥30 kills, etc. If the overall block has any stat with
+    n<100 we add a low-confidence HTML comment so the editor knows to wait."""
+    lines = []
+    lines.append(f"== Combat Stats (observed) ==")
+
+    parts = [
+        f"| mob          = {mob}",
+    ]
+    parts.append(f"| variant      = {'base' if is_known_mob(mob) else 'variant/unknown'}")
+
+    # HP estimate from per-encounter total damage to kill
+    enc = stats.get('encounter_damages', [])
+    if len(enc) >= WIKI_MIN_SAMPLES:
+        parts.append(f"| hp_estimate  = ~{max(enc)} (n={len(enc)} kills, max total damage)")
+    elif enc:
+        parts.append(f"| hp_estimate  = <!-- need n>=30, have {len(enc)} -->")
+
+    # XP yield
+    xps = stats.get('xp_samples', [])
+    if len(xps) >= WIKI_MIN_SAMPLES:
+        mean = sum(xps) / len(xps)
+        parts.append(f"| xp_per_kill  = {mean:.0f} (n={len(xps)}, range {min(xps)}-{max(xps)})")
+    elif xps:
+        mean = sum(xps) / len(xps)
+        parts.append(f"| xp_per_kill  = ~{mean:.0f} <!-- need n>=30, have {len(xps)} -->")
+
+    # Damage taken — what verbs the mob hits us with, with ranges (top 8)
+    in_verbs = stats.get('in_verbs') or {}
+    if in_verbs:
+        damage_taken_lines = _verb_breakdown_lines(in_verbs)
+        if damage_taken_lines:
+            parts.append("| damage_taken =")
+            parts.extend(damage_taken_lines)
+
+    # Damage dealt — our attacks vs this mob (top 8)
+    out_verbs = stats.get('out_verbs') or {}
+    if out_verbs:
+        damage_dealt_lines = _verb_breakdown_lines(out_verbs)
+        if damage_dealt_lines:
+            parts.append("| damage_dealt =")
+            parts.extend(damage_dealt_lines)
+
+    # School composition (incoming)
+    in_types = stats.get('in_types') or {}
+    if in_types and stats.get('damage_in', 0) > 0:
+        total = stats['damage_in']
+        items = sorted(in_types.items(), key=lambda x: -x[1])
+        schools = " / ".join(f"{c} {100*d/total:.0f}%" for c, d in items[:4])
+        parts.append(f"| schools_used = {schools}")
+
+    lines.append("{{InfoboxObserved")
+    lines.extend(parts)
+    lines.append("}}")
+
+    # Provenance comment with confidence flag
+    total_n = stats.get('hits', 0) + stats.get('hits_in', 0)
+    n_kills = stats.get('kills', 0)
+    conf = "HIGH" if total_n >= WIKI_LOW_CONF_CAP and n_kills >= 5 else \
+           "LOW — collect more data before publishing" if total_n < WIKI_LOW_CONF_CAP else \
+           "MEDIUM"
+    lines.append(f"<!-- Wyvern Tracker observed-data block")
+    lines.append(f"     Mob: {mob}")
+    lines.append(f"     Total hits sampled: {stats.get('hits', 0)} out, {stats.get('hits_in', 0)} in")
+    lines.append(f"     Kills observed: {n_kills}")
+    lines.append(f"     Confidence: {conf} -->")
+    return "\n".join(lines)
+
+
+def _new_mob_record():
+    """Default factory for `mob_stats[mob_name]`. See DPSTrackerGUI.__init__ for the
+    schema. We keep verb-level dicts and per-encounter samples so we can derive
+    wiki-shaped data (HP, damage range, XP variance) without losing distribution info."""
+    return {
+        'damage':            0,
+        'hits':              0,
+        'kills':             0,
+        'xp':                0,
+        'damage_in':         0,
+        'hits_in':           0,
+        'in_types':          {},
+        'out_verbs':         {},
+        'in_verbs':          {},
+        'encounter_damages': [],
+        'xp_samples':        [],
+        'first_seen_ms':     0,
+        'last_seen_ms':      0,
+    }
+
+
+def _update_verb_stat(verbs, verb, dmg):
+    """Accumulate min/max/total for a (mob, verb) bucket."""
+    v = verbs.get(verb)
+    if v is None:
+        verbs[verb] = {'hits': 1, 'damage_total': dmg, 'min': dmg, 'max': dmg}
+    else:
+        v['hits']         += 1
+        v['damage_total'] += dmg
+        if dmg < v['min']: v['min'] = dmg
+        if dmg > v['max']: v['max'] = dmg
+
+
+def _extract_outgoing_verb(msg):
+    """Stable verb label for an outgoing damage message. None if not parseable.
+    Multi-word forms like 'make a hole in' and 'nearly cut in half' get a
+    canonical label so the wiki output reads naturally."""
+    if not msg:
+        return None
+    if msg.startswith('Justice '):
+        return 'Justice'
+    if HOLE_RE.search(msg):
+        return 'made a hole in'
+    if NEARLY_CUT_RE.search(msg):
+        return 'nearly cut in half'
+    m = OUTGOING_VERB_RE.match(msg)
+    return m.group(1).lower() if m else None
+
+
+def _extract_incoming_verb(msg):
+    """Pull the matched verb from an incoming damage line."""
+    if not msg:
+        return None
+    if FEEL_RE.match(msg):
+        return 'feel'  # status effect — bucket separately
+    # Special multi-word patterns
+    if HOLE_RE.search(msg):
+        return 'made a hole in'
+    if NEARLY_CUT_RE.search(msg):
+        return 'nearly cut in half'
+    if TEARS_AT_RE.search(msg):
+        return 'tears at'
+    m = INCOMING_VERB_RE.search(msg)
+    return m.group(1).lower() if m else None
+
 
 class DPSTrackerGUI:
     def __init__(self):
@@ -245,6 +708,35 @@ class DPSTrackerGUI:
         self.exp_total     = 0
         self.exp_start_ms  = 0
         self.kill_count    = 0
+        # Per-mob aggregation. Schema:
+        #   damage/hits/kills/xp           — running totals
+        #   damage_in/hits_in              — running totals
+        #   in_types: {cat: damage}        — schools the mob hits us with
+        #   out_verbs: {verb: {hits,damage_total,min,max}}  — our attacks vs this mob
+        #   in_verbs:  {verb: {hits,damage_total,min,max}}  — mob's attacks vs us
+        #   encounter_damages: [int]       — total damage to kill, one per killed instance
+        #   xp_samples: [int]              — xp received per kill
+        #   first_seen_ms / last_seen_ms   — for time-spent
+        self.mob_stats = defaultdict(_new_mob_record)
+        # Active "encounter" damage tally per mob (closed on KILL, discarded on idle).
+        self.active_encounters = {}   # mob_name → {'damage': int, 'last_ts': int}
+        self.last_killed_mob = None
+        self.last_kill_ms    = 0
+        # Death forensics ring buffer — last few seconds of events leading up to death
+        self.event_ring   = deque(maxlen=80)
+        # Live Mob Stats window — None when closed
+        self._mob_stats_win  = None
+        self._mob_stats_text = None
+        # Floating mini-window — small always-on-top DPS/XP/kills readout
+        self._mini_win    = None
+        self._mini_dps    = None
+        self._mini_xphr   = None
+        self._mini_kills  = None
+        # Rolling-window samples for XP rate (deque of (ts_ms, xp))
+        self.xp_recent    = deque(maxlen=200)
+        # Last mob the player traded damage with (for active-row highlight)
+        self.last_active_mob    = None
+        self.last_active_mob_ms = 0
         self._shutdown   = False
         self._build_ui()
         self._start_log_reader()
@@ -260,6 +752,8 @@ class DPSTrackerGUI:
         def _on_key(key):
             if key == kb.Key.f12:
                 self.root.after(0, self._toggle_tracking)
+            elif key == kb.Key.f11:
+                self.root.after(0, self._toggle_mini)
         self._hotkey = kb.Listener(on_press=_on_key)
         self._hotkey.daemon = True
         self._hotkey.start()
@@ -320,12 +814,19 @@ class DPSTrackerGUI:
             bd=0, cursor='hand2', width=8, command=self._toggle_tracking)
         self.toggle_btn.pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(bf, text="Reset", font=sm, bg='#21262d', fg='#c9d1d9',
-                  bd=0, cursor='hand2', width=8, command=self._reset).pack(side=tk.LEFT)
+                  bd=0, cursor='hand2', width=8, command=self._reset).pack(
+                  side=tk.LEFT, padx=(0, 4))
+        tk.Button(bf, text="Mob Stats", font=sm, bg='#21262d', fg='#c9d1d9',
+                  bd=0, cursor='hand2', width=10, command=self._show_mob_stats).pack(
+                  side=tk.LEFT, padx=(0, 4))
+        tk.Button(bf, text="Mini (F11)", font=sm, bg='#21262d', fg='#c9d1d9',
+                  bd=0, cursor='hand2', width=10, command=self._toggle_mini).pack(
+                  side=tk.LEFT)
 
 
         # Combat log
         lf = tk.Frame(self.root, bg='#0d1117')
-        lf.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 8))
+        lf.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 4))
         tk.Label(lf, text="Combat Log", fg='#7d8590', bg='#0d1117',
                  font=lbl, anchor='w').pack(anchor='w')
         self.log = tk.Text(lf, bg='#161b22', fg='#8b949e', font=('Consolas', 9),
@@ -335,8 +836,375 @@ class DPSTrackerGUI:
                         ('kill', '#3fb950'), ('info', '#7d8590')]:
             self.log.tag_configure(tag, foreground=fg)
 
+        # Session history — full summary block appended per completed session
+        hf = tk.Frame(self.root, bg='#0d1117')
+        hf.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+        tk.Label(hf, text="Session History", fg='#d2a8ff', bg='#0d1117',
+                 font=lbl, anchor='w').pack(anchor='w')
+        self.history = tk.Text(hf, bg='#161b22', fg='#c9d1d9', font=('Consolas', 9),
+                               height=12, bd=0, state=tk.DISABLED, wrap=tk.NONE)
+        self.history.pack(fill=tk.BOTH, expand=True)
+        for tag, fg in [('hdr', '#d2a8ff'), ('out', '#58a6ff'),
+                        ('in', '#f85149'), ('info', '#7d8590')]:
+            self.history.tag_configure(tag, foreground=fg)
+
         self._tick()
         self._poll_game_alive()
+
+    def _write_history(self, text, tag='info'):
+        self.history.config(state=tk.NORMAL)
+        self.history.insert(tk.END, text + "\n", tag)
+        # Trim oldest lines so the widget doesn't grow without bound.
+        _trim_text_widget(self.history, HISTORY_MAX_LINES)
+        self.history.see(tk.END)
+        self.history.config(state=tk.DISABLED)
+
+    def _toggle_mini(self):
+        """Show/hide a tiny always-on-top window with DPS, XP/hr, kills."""
+        if self._mini_win and self._mini_win.winfo_exists():
+            self._mini_win.destroy()
+            self._mini_win = None
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Wyvern Mini")
+        win.configure(bg='#0d1117')
+        win.geometry('220x86')
+        win.attributes('-topmost', True)
+        win.protocol('WM_DELETE_WINDOW', lambda: (win.destroy(),
+                                                  setattr(self, '_mini_win', None)))
+        # Allow dragging the borderless area by clicking the body
+        for ev in ('<Button-1>', '<B1-Motion>'):
+            win.bind(ev, self._mini_drag)
+        big = tkfont.Font(family='Consolas', size=18, weight='bold')
+        sm  = tkfont.Font(family='Consolas', size=9)
+
+        row1 = tk.Frame(win, bg='#0d1117'); row1.pack(fill=tk.X, padx=8, pady=(6, 0))
+        tk.Label(row1, text="DPS",  fg='#7d8590', bg='#0d1117', font=sm).pack(side=tk.LEFT)
+        self._mini_dps = tk.Label(row1, text="—", fg='#3fb950', bg='#0d1117', font=big)
+        self._mini_dps.pack(side=tk.RIGHT)
+
+        row2 = tk.Frame(win, bg='#0d1117'); row2.pack(fill=tk.X, padx=8)
+        tk.Label(row2, text="XP/hr", fg='#7d8590', bg='#0d1117', font=sm).pack(side=tk.LEFT)
+        self._mini_xphr = tk.Label(row2, text="—", fg='#d2a8ff', bg='#0d1117', font=sm)
+        self._mini_xphr.pack(side=tk.RIGHT)
+
+        row3 = tk.Frame(win, bg='#0d1117'); row3.pack(fill=tk.X, padx=8, pady=(0, 4))
+        tk.Label(row3, text="Kills", fg='#7d8590', bg='#0d1117', font=sm).pack(side=tk.LEFT)
+        self._mini_kills = tk.Label(row3, text="0", fg='#c9d1d9', bg='#0d1117', font=sm)
+        self._mini_kills.pack(side=tk.RIGHT)
+
+        for ev in ('<Button-1>', '<B1-Motion>'):
+            for child in (row1, row2, row3):
+                child.bind(ev, self._mini_drag)
+        self._mini_win = win
+        self._refresh_mini()
+
+    def _mini_drag(self, event):
+        """Drag-to-move the mini window since it has no native title bar to grab."""
+        if not (self._mini_win and self._mini_win.winfo_exists()):
+            return
+        if event.type == tk.EventType.ButtonPress:
+            self._mini_drag_x = event.x_root - self._mini_win.winfo_x()
+            self._mini_drag_y = event.y_root - self._mini_win.winfo_y()
+        else:  # Motion
+            x = event.x_root - getattr(self, '_mini_drag_x', 0)
+            y = event.y_root - getattr(self, '_mini_drag_y', 0)
+            self._mini_win.geometry(f'+{x}+{y}')
+
+    def _refresh_mini(self):
+        if not (self._mini_win and self._mini_win.winfo_exists()):
+            return
+        # DPS — current outgoing session
+        if self.out_session and self.out_session.count:
+            dps = self.out_session.dps
+            self._mini_dps.config(text=f"{dps:.0f}",
+                fg='#3fb950' if dps >= 100 else '#58a6ff')
+        else:
+            self._mini_dps.config(text="—", fg='#484f58')
+        # XP/hr — same calc as main panel
+        rate = self._xp_rate()
+        if rate:
+            self._mini_xphr.config(text=f"{rate:,.0f}")
+        else:
+            self._mini_xphr.config(text="—")
+        self._mini_kills.config(text=str(self.kill_count))
+
+    def _show_mob_stats(self):
+        """Open the live Mob Stats window. If already open, just bring it forward."""
+        if self._mob_stats_win and self._mob_stats_win.winfo_exists():
+            self._mob_stats_win.lift()
+            self._mob_stats_win.focus_set()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Mob Stats — Live")
+        win.configure(bg='#0d1117')
+        win.geometry('1000x540')
+        win.protocol('WM_DELETE_WINDOW', self._close_mob_stats)
+
+        self._mob_stats_count_lbl = tk.Label(
+            win, text="", fg='#7d8590', bg='#0d1117', font=('Consolas', 10),
+            anchor='w')
+        self._mob_stats_count_lbl.pack(fill=tk.X, padx=10, pady=(8, 4))
+
+        body = tk.Frame(win, bg='#0d1117')
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        txt = tk.Text(body, bg='#161b22', fg='#c9d1d9', font=('Consolas', 9),
+                      bd=0, wrap=tk.NONE)
+        scroll = tk.Scrollbar(body, command=txt.yview)
+        txt.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.pack(fill=tk.BOTH, expand=True)
+
+        txt.tag_configure('hdr',       foreground='#d2a8ff')
+        txt.tag_configure('known',     foreground='#c9d1d9')
+        txt.tag_configure('unknown',   foreground='#f0883e')
+        txt.tag_configure('dim',       foreground='#7d8590')
+        txt.tag_configure('active',    background='#1f3a5a')   # highlight current fight
+
+        # Right-click on any row → context menu with "Copy as wiki markup"
+        txt.bind('<Button-3>', self._on_mob_stats_rightclick)
+
+        self._mob_stats_win  = win
+        self._mob_stats_text = txt
+        # Initial render and start the live-refresh loop
+        self._refresh_mob_stats_panel()
+        self._schedule_mob_stats_refresh()
+
+    def _on_mob_stats_rightclick(self, event):
+        txt = self._mob_stats_text
+        if not txt:
+            return
+        # Find which row tag covers the click position
+        idx = txt.index(f'@{event.x},{event.y}')
+        mob = None
+        for tag in txt.tag_names(idx):
+            if tag.startswith('mobrow:'):
+                mob = tag[len('mobrow:'):]
+                break
+        if not mob:
+            return
+        # Build the popup menu fresh each time (mob name closure)
+        menu = tk.Menu(self._mob_stats_win, tearoff=0,
+                       bg='#161b22', fg='#c9d1d9', activebackground='#21262d')
+        menu.add_command(label=f"Copy wiki markup — {mob}",
+                         command=lambda m=mob: self._copy_wiki_markup(m))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy_wiki_markup(self, mob):
+        """Format the mob's stats as MediaWiki markup and copy to clipboard."""
+        st = self.mob_stats.get(mob)
+        if not st:
+            return
+        text = _format_mob_for_wiki(mob, st)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()  # ensure clipboard is set before window changes
+        # Status feedback in the count label
+        if self._mob_stats_count_lbl:
+            self._mob_stats_count_lbl.config(
+                text=f"Copied wiki markup for: {mob}", fg='#3fb950')
+            # Restore the original text after 2s
+            self.root.after(2000, lambda: self._mob_stats_count_lbl.config(
+                text=f"{len(self.mob_stats)} mobs tracked", fg='#7d8590')
+                            if self._mob_stats_count_lbl else None)
+
+    def _close_mob_stats(self):
+        if self._mob_stats_win:
+            try:
+                self._mob_stats_win.destroy()
+            except Exception:
+                pass
+        self._mob_stats_win = None
+        self._mob_stats_text = None
+
+    def _schedule_mob_stats_refresh(self):
+        """Re-render the Mob Stats panel every second while it's open."""
+        if self._shutdown:
+            return
+        if not self._mob_stats_win or not self._mob_stats_win.winfo_exists():
+            self._mob_stats_win = None
+            self._mob_stats_text = None
+            return
+        self._refresh_mob_stats_panel()
+        self.root.after(1000, self._schedule_mob_stats_refresh)
+
+    def _refresh_mob_stats_panel(self):
+        """Rebuild the Mob Stats text content while preserving the user's scroll position."""
+        txt = self._mob_stats_text
+        if not txt:
+            return
+        # Preserve scroll so live updates don't snap the viewport back to top
+        try:
+            yview_top = txt.yview()[0]
+        except tk.TclError:
+            return
+
+        self._mob_stats_count_lbl.config(text=f"{len(self.mob_stats)} mobs tracked")
+
+        txt.config(state=tk.NORMAL)
+        txt.delete('1.0', tk.END)
+
+        # Header — out columns | in columns | in-type breakdown | meta
+        txt.insert(tk.END,
+            f"{'Mob':<28} {'Kills':>5}  "
+            f"{'Out hits':>8} {'Out dmg':>9} {'Avg':>5}  "
+            f"{'In hits':>7} {'In dmg':>8} {'In avg':>6}  "
+            f"{'In types':<24} "
+            f"{'XP':>8} {'Time':>6}\n", 'hdr')
+        txt.insert(tk.END, "-" * 130 + "\n", 'dim')
+
+        rows = sorted(self.mob_stats.items(),
+                      key=lambda x: x[1]['damage'] + x[1]['damage_in'], reverse=True)
+        any_unknown = False
+        for mob, st in rows:
+            avg_out = st['damage']    / st['hits']    if st['hits']    else 0
+            avg_in  = st['damage_in'] / st['hits_in'] if st['hits_in'] else 0
+            secs = (st['last_seen_ms'] - st['first_seen_ms']) / 1000.0 \
+                   if st['first_seen_ms'] else 0
+            time_str = f"{int(secs // 60)}:{int(secs % 60):02d}" if secs >= 60 \
+                       else f"{secs:.1f}s"
+            tag = 'known' if is_known_mob(mob) else 'unknown'
+            if tag == 'unknown':
+                any_unknown = True
+            types_str = _format_in_types(st['in_types'], st['damage_in'])
+            line = (
+                f"{mob[:26]:<28} {st['kills']:>5}  "
+                f"{st['hits']:>8} {st['damage']:>9,} {avg_out:>5.0f}  "
+                f"{st['hits_in']:>7} {st['damage_in']:>8,} {avg_in:>6.0f}  "
+                f"{types_str:<24} "
+                f"{st['xp']:>8,} {time_str:>6}\n")
+            # Per-row tag so we can detect which mob the right-click targets
+            row_tag = f"mobrow:{mob}"
+            tags = [tag, row_tag]
+            # Highlight the row of whatever mob you traded damage with in
+            # the last 3 seconds — "current fight" indicator.
+            if mob == self.last_active_mob and \
+               int(time.time() * 1000) - self.last_active_mob_ms < 3000:
+                tags.append('active')
+            txt.insert(tk.END, line, tuple(tags))
+
+        if any_unknown and KNOWN_MOBS:
+            txt.insert(tk.END, "\n", 'dim')
+            txt.insert(tk.END,
+                "Orange = mob isn't in the wiki list. Could be an NPC, a "
+                "newer mob, or a name our parser misread.\n", 'dim')
+        elif not KNOWN_MOBS:
+            txt.insert(tk.END, "\n", 'dim')
+            txt.insert(tk.END,
+                "(wyvern_mobs.txt not bundled — wiki cross-check disabled)\n",
+                'dim')
+        txt.config(state=tk.DISABLED)
+        # Restore scroll so the viewport doesn't jerk back to the top
+        try:
+            txt.yview_moveto(yview_top)
+        except tk.TclError:
+            pass
+
+    def _dump_death_forensics(self, death_ts, death_msg):
+        """On death, dump the last ~10s of events to the history panel for review."""
+        window_start = death_ts - 10_000
+        recent = [e for e in self.event_ring if e[0] >= window_start]
+        bar = "─" * 60
+        self._write_history(bar, 'info')
+        self._write_history(f" DEATH — {datetime.fromtimestamp(death_ts/1000.0).strftime('%H:%M:%S')}", 'in')
+        if death_msg:
+            self._write_history(f"   {death_msg}", 'in')
+        self._write_history(bar, 'info')
+        if not recent:
+            self._write_history("  (no events captured in last 10s)", 'info')
+        else:
+            in_total  = sum(e[2] for e in recent if e[1] == 'IN')
+            out_total = sum(e[2] for e in recent if e[1] == 'OUT')
+            xp_total  = sum(e[2] for e in recent if e[1] == 'EXP')
+            self._write_history(
+                f"  Last 10s: in {in_total:,} dmg | out {out_total:,} | xp +{xp_total:,}",
+                'info')
+            for ts, etype, dmg, cat, msg in recent[-15:]:
+                t_off = (ts - death_ts) / 1000.0
+                tag = 'in' if etype in ('IN', 'KILL', 'DEATH') else (
+                      'out' if etype == 'OUT' else 'info')
+                if etype == 'OUT':
+                    self._write_history(f"  {t_off:>6.2f}s  OUT  {dmg:>5d} [{cat}]  {msg[:60]}", tag)
+                elif etype == 'IN':
+                    snippet = (msg[:60] + '...') if msg and len(msg) > 60 else (msg or '(bare HP drop)')
+                    self._write_history(f"  {t_off:>6.2f}s   IN  {dmg:>5d} [{cat}]  {snippet}", tag)
+                elif etype == 'KILL':
+                    self._write_history(f"  {t_off:>6.2f}s  KILL  {msg[:60]}", tag)
+                elif etype == 'EXP':
+                    self._write_history(f"  {t_off:>6.2f}s  EXP  +{dmg:,}", tag)
+        self._write_history(bar, 'info')
+        self._write_history("", 'info')
+
+    def _record_session_summary(self, direction, session):
+        """Append a full summary block for a completed session to the history panel."""
+        if not session or session.count == 0:
+            return
+
+        end_ts = session.end_ms or int(time.time() * 1000)
+        tstr = datetime.fromtimestamp(end_ts / 1000.0).strftime("%H:%M:%S")
+        dur  = session.elapsed_s
+        m, s = divmod(dur, 60)
+        dur_str = f"{int(m)}:{s:05.2f}" if dur >= 60 else f"{s:.2f}s"
+
+        bar   = "─" * 60
+        label = "OUTGOING" if direction == 'out' else "INCOMING"
+        body_tag = 'out' if direction == 'out' else 'in'
+
+        self._write_history(bar, 'info')
+        self._write_history(f" {tstr}  {label}  —  {dur_str}", 'hdr')
+        self._write_history(bar, 'info')
+        self._write_history(f"  Damage      {session.total:>10,}", body_tag)
+        self._write_history(f"  DPS         {session.dps:>10.1f}", body_tag)
+        self._write_history(f"  Hits        {session.count:>10,}", body_tag)
+        if session.count:
+            self._write_history(f"  Avg hit     {session.avg:>10.0f}", body_tag)
+        self._write_history(f"  Max hit     {session.max_hit:>10,}", body_tag)
+
+        if direction == 'out':
+            cs = session.crit_stats()
+            if cs:
+                self._write_history(
+                    f"  Normal avg  {cs['normal_avg']:>10.0f}", body_tag)
+                self._write_history(
+                    f"  Crit avg    {cs['crit_avg']:>10.0f}", body_tag)
+                self._write_history(
+                    f"  Crit %      {cs['crit_pct']:>9.1f}%", body_tag)
+                self._write_history(
+                    f"  Crit boost  {'+' + format(cs['crit_boost'], '.0f') + '%':>10}",
+                    body_tag)
+
+            # Per-type breakdown
+            if session.cats:
+                self._write_history("  " + "-" * 58, 'info')
+                self._write_history(
+                    f"  {'Type':<10}{'Hits':>6}{'Dmg':>10}{'Avg':>7}{'%':>6}",
+                    'info')
+                for name, st in sorted(
+                        session.cats.items(), key=lambda x: x[1]['damage'], reverse=True):
+                    cnt, dmg = st['count'], st['damage']
+                    avg = dmg / cnt if cnt else 0
+                    pct = dmg / session.total * 100 if session.total else 0
+                    self._write_history(
+                        f"  {name:<10}{cnt:>6}{dmg:>10,}{avg:>7.0f}{pct:>5.0f}%",
+                        body_tag)
+
+            # Cumulative XP context (XP spans multiple combat sessions)
+            if self.exp_total:
+                self._write_history("  " + "-" * 58, 'info')
+                self._write_history(
+                    f"  XP total    {self.exp_total:>10,}  "
+                    f"({self.kill_count} kills, cumulative since tracking start)",
+                    'info')
+                rate = self._xp_rate()
+                if rate:
+                    self._write_history(f"  XP/hr       {rate:>10,.0f}", 'info')
+
+        self._write_history("", 'info')
 
     def _poll_game_alive(self):
         """Close ourselves when the Wyvern JVM exits."""
@@ -397,9 +1265,18 @@ class DPSTrackerGUI:
             if now - self.last_in_ms > gap:
                 self._end_session('in')
 
+        # Drop stale active encounters — if no damage for SESSION_GAP, the mob
+        # either escaped or wasn't killed by us. Don't pollute HP samples.
+        if self.active_encounters:
+            stale = [m for m, e in self.active_encounters.items()
+                     if now - e['last_ts'] > gap]
+            for m in stale:
+                del self.active_encounters[m]
+
         self._refresh(self.out_session, self.out_dps, self.out_stats, self.out_bd, '#3fb950', '#58a6ff')
         self._refresh(self.in_session,  self.in_dps,  self.in_stats,  self.in_bd,  '#f85149', '#d29922')
         self._refresh_exp()
+        self._refresh_mini()
 
         starts = [s.start_ms for s in (self.out_session, self.in_session) if s and s.start_ms]
         if starts:
@@ -478,6 +1355,7 @@ class DPSTrackerGUI:
             s.finalize()
             label = "OUT" if direction == 'out' else "IN"
             self._log(f"--- {label}: {s.dps:.1f} DPS, {s.total:,} dmg, {s.elapsed_s:.1f}s ---", 'info')
+            self._record_session_summary(direction, s)
         if direction == 'out':
             self.out_session = None
         else:
@@ -494,9 +1372,12 @@ class DPSTrackerGUI:
         elif etype == "ATTACHED":
             self._paused = False
             # Only init on first attach — re-attach must preserve accumulated
-            # exp_total so the rate stays anchored to the session's actual start
+            # exp_total so the rate stays anchored to the session's actual start.
+            # Anchor to the EVENT's timestamp (not wall-clock) so that when a
+            # tracker relaunch replays an existing log, the rate is computed
+            # against the original attach time, not "now".
             if self.exp_start_ms == 0:
-                self.exp_start_ms = int(time.time() * 1000)
+                self.exp_start_ms = ts
             self.toggle_btn.config(text="Stop (F12)", bg='#da3633')
             self.status.config(text="Tracking...", fg='#3fb950')
         elif etype == "ERROR":
@@ -521,7 +1402,30 @@ class DPSTrackerGUI:
 
             self.out_session.add(ts, dmg, cat)
             self.last_out_ms = ts
+            # Per-mob accounting
+            mob = extract_mob_outgoing(msg)
+            if mob:
+                ms = self.mob_stats[mob]
+                if not ms['first_seen_ms']:
+                    ms['first_seen_ms'] = ts
+                ms['last_seen_ms'] = ts
+                ms['damage'] += dmg
+                ms['hits']   += 1
+                self.last_active_mob    = mob
+                self.last_active_mob_ms = ts
+                # Per-verb stats — used for "X stabs you for 4-9 (n=147)" wiki output
+                verb = _extract_outgoing_verb(msg)
+                if verb:
+                    _update_verb_stat(ms['out_verbs'], verb, dmg)
+                # Active encounter — accumulate damage; closed on KILL.
+                enc = self.active_encounters.get(mob)
+                if enc is None:
+                    self.active_encounters[mob] = {'damage': dmg, 'last_ts': ts}
+                else:
+                    enc['damage']  += dmg
+                    enc['last_ts']  = ts
             elapsed = (ts - self.out_session.start_ms) / 1000.0
+            self.event_ring.append((ts, 'OUT', dmg, cat, msg))
             self._log(f"  OUT {elapsed:6.2f}s {dmg:>5d} [{cat}]", 'out')
             self.status.config(text="Tracking...", fg='#3fb950')
 
@@ -542,14 +1446,46 @@ class DPSTrackerGUI:
                 self._new_session('in')
             self.in_session.add(ts, dmg, cat)
             self.last_in_ms = ts
+            # Per-mob incoming attribution (only when we can identify the source)
+            src = extract_mob_incoming(msg) if msg else None
+            if src:
+                ms = self.mob_stats[src]
+                if not ms['first_seen_ms']:
+                    ms['first_seen_ms'] = ts
+                ms['last_seen_ms'] = ts
+                ms['damage_in'] += dmg
+                ms['hits_in']   += 1
+                self.last_active_mob    = src
+                self.last_active_mob_ms = ts
+                # Track damage by type so the Mob Stats panel can show
+                # exactly what schools each mob hits us with.
+                ms['in_types'][cat] = ms['in_types'].get(cat, 0) + dmg
+                # Per-verb stats for damage range "X bites you for 4-19 (n=89)"
+                verb = _extract_incoming_verb(msg)
+                if verb:
+                    _update_verb_stat(ms['in_verbs'], verb, dmg)
             elapsed = (ts - self.in_session.start_ms) / 1000.0
             cat_tag = f" [{cat}]" if msg else ""
+            self.event_ring.append((ts, 'IN', dmg, cat, msg))
             self._log(f"   IN {elapsed:6.2f}s {dmg:>5d}{cat_tag}", 'in')
 
         elif etype == "KILL":
             if not self._paused:
                 self.kill_count += 1
                 self._refresh_exp()
+                mob = extract_mob_kill(data)
+                if mob:
+                    ms = self.mob_stats[mob]
+                    ms['kills'] += 1
+                    ms['last_seen_ms'] = ts
+                    self.last_killed_mob = mob
+                    self.last_kill_ms    = ts
+                    # Close the active encounter — its accumulated damage is an
+                    # HP sample for this mob (max across N samples ≈ HP).
+                    enc = self.active_encounters.pop(mob, None)
+                    if enc and enc['damage'] > 0:
+                        ms['encounter_damages'].append(enc['damage'])
+            self.event_ring.append((ts, 'KILL', 0, '', data))
             self._log(f"  KILL  {data}", 'kill')
             if 'Training Dummy' in data:
                 if self.out_session and self.out_session.active:
@@ -563,14 +1499,25 @@ class DPSTrackerGUI:
                 xp = int(data)
             except ValueError:
                 return
+            # Anchor to the event's timestamp so log replays compute against
+            # the original event time, not wall-clock-now (would inflate rate).
             if self.exp_start_ms == 0:
-                self.exp_start_ms = int(time.time() * 1000)
+                self.exp_start_ms = ts
             self.exp_total += xp
+            self.xp_recent.append((ts, xp))
+            # Attribute XP to the most recently killed mob (within 2 seconds).
+            if (self.last_killed_mob and
+                    ts - self.last_kill_ms < 2000):
+                ms = self.mob_stats[self.last_killed_mob]
+                ms['xp'] += xp
+                ms['xp_samples'].append(xp)
+            self.event_ring.append((ts, 'EXP', xp, '', ''))
             self._log(f"  EXP  +{xp:,}", 'info')
             self._refresh_exp()
 
         elif etype == "DEATH":
             self._log("  DIED", 'in')
+            self._dump_death_forensics(ts, data)
             if self.out_session and self.out_session.active:
                 self._end_session('out')
             if self.in_session and self.in_session.active:
@@ -611,6 +1558,7 @@ class DPSTrackerGUI:
     def _log(self, text, tag='out'):
         self.log.config(state=tk.NORMAL)
         self.log.insert(tk.END, text + "\n", tag)
+        _trim_text_widget(self.log, COMBAT_LOG_MAX_LINES)
         self.log.see(tk.END)
         self.log.config(state=tk.DISABLED)
 
@@ -643,6 +1591,24 @@ class DPSTrackerGUI:
         if elapsed_s <= 0 or self.exp_total <= 0:
             return 0
         return self.exp_total * 3600 / elapsed_s
+
+    def _xp_rate_recent(self, window_s=60):
+        """XP/hr over the last `window_s` seconds. Returns 0 if no data."""
+        if not self.xp_recent:
+            return 0
+        now_ms = int(time.time() * 1000)
+        cutoff = now_ms - window_s * 1000
+        # Drop samples that fell out of the window
+        while self.xp_recent and self.xp_recent[0][0] < cutoff:
+            self.xp_recent.popleft()
+        if not self.xp_recent:
+            return 0
+        recent_xp = sum(xp for _, xp in self.xp_recent)
+        # Effective window — bounded by xp_start so a 30s session doesn't
+        # claim a 60s window
+        elapsed = self._xp_elapsed_s()
+        eff = min(elapsed, window_s)
+        return recent_xp * 3600 / eff if eff > 0 else 0
 
     def _print_summary(self):
         elapsed_s = self._xp_elapsed_s()
@@ -694,8 +1660,19 @@ class DPSTrackerGUI:
         if elapsed_s < 10:
             self.exp_rate_lbl.config(text="… XP/hr", fg='#7d8590')
         else:
+            life_rate   = self._xp_rate(elapsed_s)
+            recent_rate = self._xp_rate_recent(60) if elapsed_s >= 30 else 0
+            arrow = ""
+            if recent_rate > 0:
+                # Show ↑ if last 60s is >10% above lifetime, ↓ if >10% below, → if flat
+                if recent_rate > life_rate * 1.10:
+                    arrow = " ↑"
+                elif recent_rate < life_rate * 0.90:
+                    arrow = " ↓"
+                else:
+                    arrow = " →"
             self.exp_rate_lbl.config(
-                text=f"{self._xp_rate(elapsed_s):,.0f} XP/hr", fg='#d2a8ff')
+                text=f"{life_rate:,.0f} XP/hr{arrow}", fg='#d2a8ff')
 
     def _reset(self):
         if self.out_session and self.out_session.active:
@@ -711,6 +1688,16 @@ class DPSTrackerGUI:
         self.exp_total     = 0
         self.exp_start_ms  = 0
         self.kill_count    = 0
+        self.mob_stats.clear()
+        self.active_encounters.clear()
+        self.last_killed_mob = None
+        self.last_kill_ms    = 0
+        self.event_ring.clear()
+        self.xp_recent.clear()
+        self.last_active_mob    = None
+        self.last_active_mob_ms = 0
+        # Note: history panel is intentionally NOT cleared here — survives Reset
+        # so the user can review past sessions/deaths after wiping live state.
         self.exp_labels["Total XP"].config(text="0")
         self.exp_labels["Kills"].config(text="0")
         self.exp_rate_lbl.config(text="— XP/hr", fg='#484f58')

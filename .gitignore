@@ -10,3 +10,4 @@ test_*.log
 agent_*.jar
 out_dps*/
 agent_new.jar
+mob_reports/

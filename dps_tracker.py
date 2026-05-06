@@ -445,9 +445,21 @@ class Session:
     active:   bool = True
     cats:     dict = field(default_factory=lambda: defaultdict(
         lambda: {'damage': 0, 'count': 0, 'max': 0}))
-    backstab_total: int = 0
-    backstab_count: int = 0
-    backstab_max:   int = 0
+    # Backstab and non-backstab tracked separately so we can show
+    # mean/stdev/min/max for each. Welford's online algorithm avoids
+    # keeping all hits in memory.
+    backstab_count: int   = 0
+    backstab_total: int   = 0
+    backstab_min:   int   = 0
+    backstab_max:   int   = 0
+    backstab_mean:  float = 0.0
+    backstab_m2:    float = 0.0
+    normal_count:   int   = 0
+    normal_total:   int   = 0
+    normal_min:     int   = 0
+    normal_max:     int   = 0
+    normal_mean:    float = 0.0
+    normal_m2:      float = 0.0
 
     @property
     def elapsed_s(self):
@@ -462,11 +474,23 @@ class Session:
     @property
     def dps_no_backstab(self):
         e = self.elapsed_s
-        return (self.total - self.backstab_total) / e if e > 0 else 0.0
+        return self.normal_total / e if e > 0 else 0.0
 
     @property
     def avg(self):
         return self.total / self.count if self.count else 0.0
+
+    @property
+    def backstab_stdev(self):
+        if self.backstab_count < 2:
+            return 0.0
+        return (self.backstab_m2 / (self.backstab_count - 1)) ** 0.5
+
+    @property
+    def normal_stdev(self):
+        if self.normal_count < 2:
+            return 0.0
+        return (self.normal_m2 / (self.normal_count - 1)) ** 0.5
 
     def add(self, ts, damage, cat='Unknown', backstab=False):
         if not self.start_ms:
@@ -476,10 +500,29 @@ class Session:
         self.count   += 1
         self.max_hit  = max(self.max_hit, damage)
         if backstab:
-            self.backstab_total += damage
             self.backstab_count += 1
-            if damage > self.backstab_max:
+            self.backstab_total += damage
+            if self.backstab_count == 1:
+                self.backstab_min = damage
                 self.backstab_max = damage
+            else:
+                if damage < self.backstab_min: self.backstab_min = damage
+                if damage > self.backstab_max: self.backstab_max = damage
+            delta = damage - self.backstab_mean
+            self.backstab_mean += delta / self.backstab_count
+            self.backstab_m2   += delta * (damage - self.backstab_mean)
+        else:
+            self.normal_count += 1
+            self.normal_total += damage
+            if self.normal_count == 1:
+                self.normal_min = damage
+                self.normal_max = damage
+            else:
+                if damage < self.normal_min: self.normal_min = damage
+                if damage > self.normal_max: self.normal_max = damage
+            delta = damage - self.normal_mean
+            self.normal_mean += delta / self.normal_count
+            self.normal_m2   += delta * (damage - self.normal_mean)
         c = self.cats[cat]
         c['damage'] += damage
         c['count']  += 1
@@ -1169,10 +1212,19 @@ class DPSTrackerGUI:
 
         if direction == 'out':
             if session.backstab_count > 0:
-                bs_pct = session.backstab_total / session.total * 100 if session.total else 0
-                self._write_history(
-                    f"  Backstab    {session.backstab_count}x  {session.backstab_total:,} dmg "
-                    f"({bs_pct:.0f}% of total)", body_tag)
+                self._write_history("", body_tag)
+                self._write_history(f"  Backstab hit statistics:", body_tag)
+                self._write_history(f"      Mean: {session.backstab_mean};", body_tag)
+                self._write_history(f"      Stdev: {session.backstab_stdev};", body_tag)
+                self._write_history(f"      Min: {session.backstab_min};", body_tag)
+                self._write_history(f"      Max: {session.backstab_max}", body_tag)
+            if session.normal_count > 0 and session.backstab_count > 0:
+                self._write_history("", body_tag)
+                self._write_history(f"  Non-backstab hit statistics:", body_tag)
+                self._write_history(f"      Mean: {session.normal_mean};", body_tag)
+                self._write_history(f"      Stdev: {session.normal_stdev};", body_tag)
+                self._write_history(f"      Min: {session.normal_min};", body_tag)
+                self._write_history(f"      Max: {session.normal_max}", body_tag)
 
             # Per-type breakdown
             if session.cats:
@@ -1657,10 +1709,19 @@ class DPSTrackerGUI:
             s = self.out_session
             self._log(f"  OUT dmg     {s.total:>10,}  ({s.count} hits, {s.dps:.1f} DPS)", 'out')
             if s.backstab_count > 0:
-                bs_pct = s.backstab_total / s.total * 100 if s.total else 0
-                self._log(
-                    f"  Backstab    {s.backstab_count}x ({bs_pct:.0f}% / {s.backstab_total:,} dmg)",
-                    'out')
+                self._log("", 'out')
+                self._log(f"  Backstab hit statistics:", 'out')
+                self._log(f"      Mean: {s.backstab_mean};", 'out')
+                self._log(f"      Stdev: {s.backstab_stdev};", 'out')
+                self._log(f"      Min: {s.backstab_min};", 'out')
+                self._log(f"      Max: {s.backstab_max}", 'out')
+            if s.normal_count > 0 and s.backstab_count > 0:
+                self._log("", 'out')
+                self._log(f"  Non-backstab hit statistics:", 'out')
+                self._log(f"      Mean: {s.normal_mean};", 'out')
+                self._log(f"      Stdev: {s.normal_stdev};", 'out')
+                self._log(f"      Min: {s.normal_min};", 'out')
+                self._log(f"      Max: {s.normal_max}", 'out')
 
         # Incoming damage
         if self.in_session and self.in_session.count:

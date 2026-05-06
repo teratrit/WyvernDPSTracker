@@ -786,7 +786,7 @@ class DPSTrackerGUI:
         self.root.title("Wyvern DPS Tracker")
         self.root.attributes('-topmost', True)
         self.root.configure(bg='#0d1117')
-        self.root.geometry('440x820')
+        self.root.geometry('440x1100')
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         def _on_key(key):

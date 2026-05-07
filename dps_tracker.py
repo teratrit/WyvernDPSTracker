@@ -772,6 +772,7 @@ class DPSTrackerGUI:
         self._mini_dps    = None
         self._mini_xphr   = None
         self._mini_kills  = None
+        self._mini_top    = None
         # Rolling-window samples for XP rate (deque of (ts_ms, xp))
         self.xp_recent    = deque(maxlen=200)
         # Last mob the player traded damage with (for active-row highlight)
@@ -908,7 +909,7 @@ class DPSTrackerGUI:
         win = tk.Toplevel(self.root)
         win.title("Wyvern Mini")
         win.configure(bg='#0d1117')
-        win.geometry('220x86')
+        win.geometry('220x108')
         win.attributes('-topmost', True)
         win.protocol('WM_DELETE_WINDOW', lambda: (win.destroy(),
                                                   setattr(self, '_mini_win', None)))
@@ -928,13 +929,18 @@ class DPSTrackerGUI:
         self._mini_xphr = tk.Label(row2, text="—", fg='#d2a8ff', bg='#0d1117', font=sm)
         self._mini_xphr.pack(side=tk.RIGHT)
 
-        row3 = tk.Frame(win, bg='#0d1117'); row3.pack(fill=tk.X, padx=8, pady=(0, 4))
+        row3 = tk.Frame(win, bg='#0d1117'); row3.pack(fill=tk.X, padx=8)
         tk.Label(row3, text="Kills", fg='#7d8590', bg='#0d1117', font=sm).pack(side=tk.LEFT)
         self._mini_kills = tk.Label(row3, text="0", fg='#c9d1d9', bg='#0d1117', font=sm)
         self._mini_kills.pack(side=tk.RIGHT)
 
+        row4 = tk.Frame(win, bg='#0d1117'); row4.pack(fill=tk.X, padx=8, pady=(0, 4))
+        tk.Label(row4, text="Top hit", fg='#7d8590', bg='#0d1117', font=sm).pack(side=tk.LEFT)
+        self._mini_top = tk.Label(row4, text="0", fg='#f0883e', bg='#0d1117', font=sm)
+        self._mini_top.pack(side=tk.RIGHT)
+
         for ev in ('<Button-1>', '<B1-Motion>'):
-            for child in (row1, row2, row3):
+            for child in (row1, row2, row3, row4):
                 child.bind(ev, self._mini_drag)
         self._mini_win = win
         self._refresh_mini()
@@ -968,6 +974,8 @@ class DPSTrackerGUI:
         else:
             self._mini_xphr.config(text="—")
         self._mini_kills.config(text=str(self.kill_count))
+        top = self.out_session.max_hit if self.out_session else 0
+        self._mini_top.config(text=f"{top:,}" if top else "0")
 
     def _show_mob_stats(self):
         """Open the live Mob Stats window. If already open, just bring it forward."""

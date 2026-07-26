@@ -21,12 +21,16 @@ Grab `WyvernDPSTracker.exe` from the [latest release](https://github.com/teratri
 
 ## Usage
 
-**Steam:**
+**Steam (recommended one-time setup):** add
+`--remote-debugging-port=9222` to Wyvern's Steam launch options
+(Library > Wyvern > Properties > Launch Options). The tracker then binds
+to your already-running game every time.
+
 1. Run `WyvernDPSTracker.exe`
-2. If Wyvern isn't running, the tracker launches it for you.
-   If Wyvern IS already running, close it first (or add
-   `--remote-debugging-port=9222` to its Steam launch options once, and the
-   tracker will attach to the running game from then on).
+2. It binds to the running game. Without the launch option set, it can't
+   attach to an already-running game (a debugger can only attach to a
+   process started with the debug port) — it will show the setup
+   instructions and offer to relaunch the game itself.
 3. Fight stuff
 
 **Browser:**

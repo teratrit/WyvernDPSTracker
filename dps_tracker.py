@@ -1912,7 +1912,7 @@ def find_browser_exe():
     return None, None
 
 
-def launch_browser_client():
+def launch_browser_client(port=CDP_PORT):
     """Launch Chrome/Edge with the debug port on the game URL.
 
     Modern Chrome only honors --remote-debugging-port together with a
@@ -1930,16 +1930,39 @@ def launch_browser_client():
     print(f"Launching {name} (tracker profile) at {GAME_URL}...")
     return subprocess.Popen([
         str(exe),
-        f"--remote-debugging-port={CDP_PORT}",
+        f"--remote-debugging-port={port}",
         f"--user-data-dir={profile}",
         "--no-first-run",
         GAME_URL,
     ])
 
 
+def _find_game_port():
+    """First debug port that actually has a GAME page on it, or 0.
+
+    An unrelated debug-enabled browser can squat a port with no game tab -
+    binding to "any CDP" would attach to the wrong thing forever.
+    """
+    import web_capture
+    for port in (CDP_PORT, CDP_PORT + 1, CDP_PORT + 2):
+        if web_capture.find_game_target(port):
+            return port
+    return 0
+
+
+def _free_launch_port():
+    """A debug port not occupied by an unrelated CDP endpoint."""
+    import web_capture
+    for port in (CDP_PORT, CDP_PORT + 1, CDP_PORT + 2):
+        if not web_capture.cdp_alive(port):
+            return port
+    return CDP_PORT
+
+
 def attach_web(prefer_browser=False):
     """Attach to the game via CDP — the Steam Electron client or a Chromium
-    browser playing play.ghosttrack.com — launching one if needed.
+    browser playing play.ghosttrack.com — binding to an existing debug-enabled
+    game when there is one, launching one only when there isn't.
 
     Returns True on success, or an error string for main() to print.
     """
@@ -1950,31 +1973,41 @@ def attach_web(prefer_browser=False):
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     LOG_FILE = run / f"dps_events_{ts_str}.log"
 
-    if not web_capture.cdp_alive(CDP_PORT):
+    port = _find_game_port()
+    if not port:
         running = client_pids()
         if running and not prefer_browser:
-            print("Wyvern is running but without the debug port the tracker needs.")
-            print("Close Wyvern and the tracker will relaunch it automatically,")
-            print(f"or add  --remote-debugging-port={CDP_PORT}  to its Steam launch")
-            print("options and restart it yourself.  Waiting...")
+            print("Wyvern is running but wasn't started with the debug port,")
+            print("so the tracker can't bind to it.")
+            print()
+            print("One-time fix so this never happens again: Steam > Library >")
+            print("Wyvern > Properties > Launch Options:")
+            print(f"    --remote-debugging-port={CDP_PORT}")
+            print("Then restart the game (your session resumes) - the tracker")
+            print("will bind to the running game from then on.")
+            print()
+            print("Or just close Wyvern now and the tracker relaunches it.")
+            print("Waiting...")
             while True:
                 time.sleep(2)
-                if web_capture.cdp_alive(CDP_PORT):
+                port = _find_game_port()
+                if port:
                     break
                 if not client_pids():
                     running = []
                     break
 
-        if not web_capture.cdp_alive(CDP_PORT):
+        if not port:
+            launch_port = _free_launch_port()
             steam_exe = None if prefer_browser else find_client_exe()
             if steam_exe:
-                print(f"Launching {steam_exe.name} with debug port {CDP_PORT}...")
+                print(f"Launching {steam_exe.name} with debug port {launch_port}...")
                 proc = subprocess.Popen(
-                    [str(steam_exe), f"--remote-debugging-port={CDP_PORT}"],
+                    [str(steam_exe), f"--remote-debugging-port={launch_port}"],
                     cwd=str(steam_exe.parent))
                 GAME_PID = proc.pid
             else:
-                proc = launch_browser_client()
+                proc = launch_browser_client(launch_port)
                 if isinstance(proc, str):
                     return proc
                 # No PID watch for browsers: the Chromium launcher process
@@ -1983,7 +2016,8 @@ def attach_web(prefer_browser=False):
                 # browser actually closing.
             deadline = time.time() + 30
             while time.time() < deadline:
-                if web_capture.cdp_alive(CDP_PORT):
+                if web_capture.cdp_alive(launch_port):
+                    port = launch_port
                     break
                 time.sleep(0.5)
             else:
@@ -1994,9 +2028,9 @@ def attach_web(prefer_browser=False):
         if pids:
             GAME_PID = pids[0]
 
-    print("Attaching to Wyvern...")
+    print(f"Attaching to Wyvern (port {port})...")
     WEB_CAPTURE = web_capture.WebCapture(
-        CDP_PORT, _make_event_writer(LOG_FILE))
+        port, _make_event_writer(LOG_FILE))
     WEB_CAPTURE.start()
     return True
 

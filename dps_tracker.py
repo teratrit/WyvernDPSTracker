@@ -183,8 +183,6 @@ _DAMAGE_TAIL     = re.compile(r'\s+for\s+\d+\s+damage[!.]?\s*$', re.I)
 # Only known-status words are stripped so mob name variants like
 # "Acid Hydros (cursed)" stay intact.
 _STATUS_TAG_RE   = re.compile(r'\s*\((?:Frostbitten)\)', re.I)
-# Quick check whether a damage line currently has the Frostbitten tag on it.
-FROSTBITTEN_RE   = re.compile(r'\(Frostbitten\)', re.I)
 _JUSTICE_CLEAVES = re.compile(r'^Justice\s+cleaves\s+', re.I)
 _JUSTICE_RAINS   = re.compile(r'^Justice\s+rains\s+down.+?\s+upon\s+', re.I)
 _DREAM_EATER     = re.compile(r'^Dream\s+Eater\s+rips\s+through\s+', re.I)
@@ -438,12 +436,6 @@ def categorize_incoming(msg):
 
 HITS_BUFFER_MAX = 5000
 BACKSTAB_TIMEOUT_MS = 2000
-# Time without seeing "(Frostbitten)" on a mob before we consider its
-# Frostbite debuff expired and record the duration.
-FROSTBITE_TIMEOUT_MS = 10000
-# Appended to on every closed Frostbite duration sample. One row per sample,
-# "<close_ts_ms>|<duration_ms>|<reason>", reason in {untagged, kill, timeout}.
-FROSTBITE_LOG_NAME   = 'frostbite_durations.log'
 
 
 @dataclass
@@ -701,6 +693,7 @@ def _new_mob_record():
         'last_seen_ms':      0,
         'backstab_damage':   0,
         'backstab_hits':     0,
+        'out_types':         {},
     }
 
 
@@ -797,24 +790,18 @@ class DPSTrackerGUI:
         # Last mob the player traded damage with (for active-row highlight)
         self.last_active_mob    = None
         self.last_active_mob_ms = 0
-        # Frostbite tracking, single-target assumption: we see "(Frostbitten)"
-        # somewhere in chat, that's our active timer. First non-tagged player
-        # hit closes the sample. Closed samples are appended to both the
-        # in-memory deque (for the GUI panel) and frostbite_durations.log
-        # (for offline analysis - survives restarts).
-        self.frostbite_start_ms = 0
-        self.frostbite_last_ms  = 0
-        self.frostbite_samples  = deque(maxlen=200)
-        self.frostbite_log_path = SCRIPT_DIR / FROSTBITE_LOG_NAME
         # Web capture: our own entityId (from PLAYER event) and the last time
         # a DMG-feed event arrived. While the DMG feed is live it is the
         # authoritative source for session damage; OUT/IN text events then do
-        # bookkeeping only (mob names, verbs, frostbite) to avoid
-        # double-counting.
+        # bookkeeping only (mob names and verbs) to avoid double-counting.
         self.player_entity_id = 0
         self.dmg_live_ms      = 0
-        self._frost_win  = None
-        self._frost_text = None
+        # Per-entity damage ledger from the DMG feed. Entity ids are anonymous
+        # until a KILL line names the mob; at that point the freshest entity's
+        # totals are attributed to mob_stats under the mob's name. This keeps
+        # mob stats working with hitmsgs off and keys concurrent same-name
+        # mobs separately.
+        self.entity_stats = {}
         self._shutdown   = False
         self._build_ui()
         self._start_log_reader()
@@ -899,9 +886,6 @@ class DPSTrackerGUI:
                   side=tk.LEFT, padx=(0, 4))
         tk.Button(bf, text="Mini (F11)", font=sm, bg='#21262d', fg='#c9d1d9',
                   bd=0, cursor='hand2', width=10, command=self._toggle_mini).pack(
-                  side=tk.LEFT, padx=(0, 4))
-        tk.Button(bf, text="Frostbite", font=sm, bg='#21262d', fg='#c9d1d9',
-                  bd=0, cursor='hand2', width=10, command=self._show_frostbite).pack(
                   side=tk.LEFT)
 
 
@@ -1017,116 +1001,6 @@ class DPSTrackerGUI:
         top = self.out_session.max_hit if self.out_session else 0
         self._mini_top.config(text=f"{top:,}" if top else "0")
 
-    def _close_frostbite_sample(self, close_ts, reason):
-        """Close the currently rolling frostbite timer if any. Records the
-        duration to both the in-memory deque (GUI) and the persistent log
-        file (offline analysis). No-op if no timer is rolling or duration
-        is zero. `reason` is one of: untagged, kill, timeout."""
-        if not self.frostbite_start_ms:
-            return
-        dur = self.frostbite_last_ms - self.frostbite_start_ms
-        self.frostbite_start_ms = 0
-        self.frostbite_last_ms  = 0
-        if dur <= 0:
-            return
-        self.frostbite_samples.append(dur)
-        try:
-            with open(self.frostbite_log_path, 'a', encoding='utf-8') as fh:
-                fh.write(f"{close_ts}|{dur}|{reason}\n")
-        except OSError:
-            # Don't crash the tracker over a log write - the in-memory deque
-            # still has the sample for the GUI session.
-            pass
-
-    def _show_frostbite(self):
-        """Open the live Frostbite tracker, or bring it forward if already open."""
-        if self._frost_win and self._frost_win.winfo_exists():
-            self._frost_win.lift()
-            self._frost_win.focus_set()
-            return
-        win = tk.Toplevel(self.root)
-        win.title("Frostbite")
-        win.configure(bg='#0d1117')
-        win.geometry('480x420')
-        win.protocol('WM_DELETE_WINDOW', self._close_frostbite)
-
-        txt = tk.Text(win, bg='#161b22', fg='#c9d1d9', font=('Consolas', 9),
-                      bd=0, wrap=tk.NONE)
-        txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        for tag, fg in [('hdr', '#d2a8ff'), ('active', '#87ceeb'),
-                        ('row', '#c9d1d9'), ('dim', '#7d8590')]:
-            txt.tag_configure(tag, foreground=fg)
-
-        self._frost_win  = win
-        self._frost_text = txt
-        self._refresh_frostbite_panel()
-        self._schedule_frostbite_refresh()
-
-    def _close_frostbite(self):
-        if self._frost_win:
-            try:
-                self._frost_win.destroy()
-            except Exception:
-                pass
-        self._frost_win  = None
-        self._frost_text = None
-
-    def _schedule_frostbite_refresh(self):
-        if self._shutdown:
-            return
-        if not self._frost_win or not self._frost_win.winfo_exists():
-            self._frost_win  = None
-            self._frost_text = None
-            return
-        self._refresh_frostbite_panel()
-        self.root.after(1000, self._schedule_frostbite_refresh)
-
-    def _refresh_frostbite_panel(self):
-        txt = self._frost_text
-        if not txt:
-            return
-        try:
-            yview_top = txt.yview()[0]
-        except tk.TclError:
-            return
-        now = int(time.time() * 1000)
-        txt.config(state=tk.NORMAL)
-        txt.delete('1.0', tk.END)
-
-        txt.insert(tk.END, "Currently active\n", 'hdr')
-        txt.insert(tk.END, "-" * 50 + "\n", 'dim')
-        if self.frostbite_start_ms:
-            elapsed = (now - self.frostbite_start_ms) / 1000.0
-            since   = (now - self.frostbite_last_ms)  / 1000.0
-            txt.insert(tk.END,
-                f"  rolling {elapsed:>5.1f}s  (last seen {since:.1f}s ago)\n",
-                'active')
-        else:
-            txt.insert(tk.END, "  (inactive)\n", 'dim')
-
-        txt.insert(tk.END, "\n")
-        txt.insert(tk.END, f"Recent durations  (n={len(self.frostbite_samples)})\n", 'hdr')
-        txt.insert(tk.END, "-" * 50 + "\n", 'dim')
-        if self.frostbite_samples:
-            for dur_ms in list(self.frostbite_samples)[-15:][::-1]:
-                txt.insert(tk.END, f"  {dur_ms/1000.0:>5.1f}s\n", 'row')
-        else:
-            txt.insert(tk.END, "  (none yet)\n", 'dim')
-
-        if self.frostbite_samples:
-            durs = sorted(self.frostbite_samples)
-            n = len(durs)
-            mean   = sum(durs) / n
-            median = durs[n // 2]
-            txt.insert(tk.END, "\n")
-            txt.insert(tk.END, "Summary\n", 'hdr')
-            txt.insert(tk.END, "-" * 50 + "\n", 'dim')
-            txt.insert(tk.END, f"  Mean:   {mean/1000.0:>5.2f}s\n", 'row')
-            txt.insert(tk.END, f"  Median: {median/1000.0:>5.2f}s\n", 'row')
-            txt.insert(tk.END, f"  Min:    {min(durs)/1000.0:>5.2f}s\n", 'row')
-            txt.insert(tk.END, f"  Max:    {max(durs)/1000.0:>5.2f}s\n", 'row')
-
-        txt.config(state=tk.DISABLED)
         try:
             txt.yview_moveto(yview_top)
         except tk.TclError:
@@ -1494,14 +1368,13 @@ class DPSTrackerGUI:
             for m in stale:
                 del self.active_encounters[m]
 
-        # Close out a rolling frostbite that hasn't been refreshed within the
-        # timeout - mob died silently, we walked away, etc. Use the latest
-        # event ts (not wall-clock now) so log replays don't flush on the
-        # first tick. Skip zero-duration samples.
-        if self.frostbite_start_ms:
-            latest_event_ms = max(self.last_out_ms, self.last_in_ms)
-            if latest_event_ms and latest_event_ms - self.frostbite_last_ms > FROSTBITE_TIMEOUT_MS:
-                self._close_frostbite_sample(self.frostbite_last_ms, 'timeout')
+        # Drop entity ledgers that went quiet without a KILL (fled, map
+        # change, someone else's kill) so they can't be misattributed later.
+        if self.entity_stats:
+            stale = [e for e, es in self.entity_stats.items()
+                     if now - es['last_ts'] > 60000]
+            for e in stale:
+                del self.entity_stats[e]
 
         self._refresh(self.out_session, self.out_dps, self.out_stats, self.out_bd, '#3fb950', '#58a6ff')
         self._refresh(self.in_session,  self.in_dps,  self.in_stats,  self.in_bd,  '#f85149', '#d29922')
@@ -1666,6 +1539,19 @@ class DPSTrackerGUI:
                 self.out_session.add(ts, dmg, cat,
                                      backstab=is_backstab, crit=crit)
                 self.last_out_ms = ts
+                es = self.entity_stats.get(eid)
+                if es is None:
+                    es = self.entity_stats[eid] = {
+                        'damage': 0, 'hits': 0, 'types': {},
+                        'backstab_damage': 0, 'backstab_hits': 0,
+                        'first_ts': ts, 'last_ts': ts}
+                es['damage'] += dmg
+                es['hits']   += 1
+                es['last_ts'] = ts
+                es['types'][cat] = es['types'].get(cat, 0) + dmg
+                if is_backstab:
+                    es['backstab_damage'] += dmg
+                    es['backstab_hits']   += 1
                 elapsed = (ts - self.out_session.start_ms) / 1000.0
                 self.event_ring.append((ts, 'OUT', dmg, cat, f'entity {eid}'))
                 tag = ' CRIT' if crit else (' BS' if is_backstab else '')
@@ -1702,41 +1588,34 @@ class DPSTrackerGUI:
 
                 self.out_session.add(ts, dmg, cat, backstab=is_backstab)
                 self.last_out_ms = ts
-            # Per-mob accounting
+            # Per-mob accounting. With the DMG feed live, damage/hit totals
+            # come from the per-entity ledger (attributed on KILL) - the text
+            # line then contributes only what text uniquely has: verbs.
             mob = extract_mob_outgoing(msg)
-            # Frostbite duration tracking. Single-target assumption: any chat
-            # line with "(Frostbitten)" means the debuff is rolling. An OUT
-            # hit on a mob WITHOUT the tag means it's worn off, so we close
-            # the sample. _tick handles silent expiry (timeout sweep).
-            if FROSTBITTEN_RE.search(msg):
-                if self.frostbite_start_ms == 0:
-                    self.frostbite_start_ms = ts
-                self.frostbite_last_ms = ts
-            elif self.frostbite_start_ms:
-                self._close_frostbite_sample(ts, 'untagged')
             if mob:
                 ms = self.mob_stats[mob]
                 if not ms['first_seen_ms']:
                     ms['first_seen_ms'] = ts
                 ms['last_seen_ms'] = ts
-                ms['damage'] += dmg
-                ms['hits']   += 1
-                if is_backstab:
-                    ms['backstab_damage'] += dmg
-                    ms['backstab_hits']   += 1
                 self.last_active_mob    = mob
                 self.last_active_mob_ms = ts
                 # Per-verb stats - used for "X stabs you for 4-9 (n=147)" wiki output
                 verb = _extract_outgoing_verb(msg)
                 if verb:
                     _update_verb_stat(ms['out_verbs'], verb, dmg)
-                # Active encounter - accumulate damage; closed on KILL.
-                enc = self.active_encounters.get(mob)
-                if enc is None:
-                    self.active_encounters[mob] = {'damage': dmg, 'last_ts': ts}
-                else:
-                    enc['damage']  += dmg
-                    enc['last_ts']  = ts
+                if not dmg_live:
+                    ms['damage'] += dmg
+                    ms['hits']   += 1
+                    if is_backstab:
+                        ms['backstab_damage'] += dmg
+                        ms['backstab_hits']   += 1
+                    # Active encounter - accumulate damage; closed on KILL.
+                    enc = self.active_encounters.get(mob)
+                    if enc is None:
+                        self.active_encounters[mob] = {'damage': dmg, 'last_ts': ts}
+                    else:
+                        enc['damage']  += dmg
+                        enc['last_ts']  = ts
             if not dmg_live:
                 elapsed = (ts - self.out_session.start_ms) / 1000.0
                 self.event_ring.append((ts, 'OUT', dmg, cat, msg))
@@ -1799,17 +1678,35 @@ class DPSTrackerGUI:
                     ms = self.mob_stats[mob]
                     ms['kills'] += 1
                     ms['last_seen_ms'] = ts
+                    if not ms['first_seen_ms']:
+                        ms['first_seen_ms'] = ts
                     self.last_killed_mob = mob
                     self.last_kill_ms    = ts
-                    # Close the active encounter - its accumulated damage is an
-                    # HP sample for this mob (max across N samples ≈ HP).
+                    # Entity attribution: the KILL line names the mob; the
+                    # entity ledger has its exact damage. The freshest entity
+                    # hit within the last 3s is the one that just died.
+                    eid = None
+                    if self.entity_stats:
+                        cand = max(self.entity_stats,
+                                   key=lambda e: self.entity_stats[e]['last_ts'])
+                        if ts - self.entity_stats[cand]['last_ts'] < 3000:
+                            eid = cand
+                    if eid is not None:
+                        es = self.entity_stats.pop(eid)
+                        ms['damage'] += es['damage']
+                        ms['hits']   += es['hits']
+                        ms['backstab_damage'] += es['backstab_damage']
+                        ms['backstab_hits']   += es['backstab_hits']
+                        for t, d in es['types'].items():
+                            ms['out_types'][t] = ms['out_types'].get(t, 0) + d
+                        # Exact damage-to-kill for this instance - an HP sample.
+                        if es['damage'] > 0:
+                            ms['encounter_damages'].append(es['damage'])
+                    # Text-based encounter close (only accumulates when the
+                    # DMG feed is not live).
                     enc = self.active_encounters.pop(mob, None)
                     if enc and enc['damage'] > 0:
                         ms['encounter_damages'].append(enc['damage'])
-                    # Close any rolling Frostbite at the moment of death so
-                    # we don't keep counting up to the timeout sweep.
-                    if self.frostbite_start_ms:
-                        self._close_frostbite_sample(ts, 'kill')
             self.event_ring.append((ts, 'KILL', 0, '', data))
             self._log(f"  KILL  {data}", 'kill')
             if 'Training Dummy' in data:
@@ -2027,12 +1924,10 @@ class DPSTrackerGUI:
         self.last_kill_ms    = 0
         self.event_ring.clear()
         self.xp_recent.clear()
+        self.entity_stats.clear()
         self.last_active_mob    = None
         self.last_active_mob_ms = 0
         self.backstab_pending_until_ms = 0
-        self.frostbite_start_ms = 0
-        self.frostbite_last_ms  = 0
-        self.frostbite_samples.clear()
         # Note: history panel is intentionally NOT cleared here - survives Reset
         # so the user can review past sessions/deaths after wiping live state.
         self.exp_labels["Total XP"].config(text="0")

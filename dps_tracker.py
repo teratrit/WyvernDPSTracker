@@ -1177,6 +1177,10 @@ class DPSTrackerGUI:
             ms['backstab_hits']   += es['backstab_hits']
             for t, d in es['types'].items():
                 ms['out_types'][t] = ms['out_types'].get(t, 0) + d
+            ms['damage_in'] += es['damage_in']
+            ms['hits_in']   += es['hits_in']
+            for t, d in es['in_types'].items():
+                ms['in_types'][t] = ms['in_types'].get(t, 0) + d
             # Exact damage-to-kill for this instance - an HP sample.
             if es['damage'] > 0:
                 ms['encounter_damages'].append(es['damage'])
@@ -1338,6 +1342,18 @@ class DPSTrackerGUI:
                     self._new_session('in')
                 self.in_session.add(ts, dmg, cat, crit=crit)
                 self.last_in_ms = ts
+                # Attribute the hit to the entity we're actively fighting
+                # (freshest target within 3s). The feed doesn't name the
+                # attacker, so this is a fighting-it heuristic - exact in a
+                # melee brawl, approximate in mixed packs.
+                if self.entity_stats:
+                    tgt = max(self.entity_stats,
+                              key=lambda e: self.entity_stats[e]['last_ts'])
+                    tes = self.entity_stats[tgt]
+                    if ts - tes['last_ts'] < 3000:
+                        tes['damage_in'] += dmg
+                        tes['hits_in']   += 1
+                        tes['in_types'][cat] = tes['in_types'].get(cat, 0) + dmg
                 elapsed = (ts - self.in_session.start_ms) / 1000.0
                 self.event_ring.append((ts, 'IN', dmg, cat, f'entity {eid}'))
                 self._log(f"   IN {elapsed:6.2f}s {dmg:>5d} [{cat}]", 'in')
@@ -1356,6 +1372,7 @@ class DPSTrackerGUI:
                     es = self.entity_stats[eid] = {
                         'damage': 0, 'hits': 0, 'types': {},
                         'backstab_damage': 0, 'backstab_hits': 0,
+                        'damage_in': 0, 'hits_in': 0, 'in_types': {},
                         'first_ts': ts, 'last_ts': ts}
                 es['damage'] += dmg
                 es['hits']   += 1
@@ -1460,13 +1477,15 @@ class DPSTrackerGUI:
                 if not ms['first_seen_ms']:
                     ms['first_seen_ms'] = ts
                 ms['last_seen_ms'] = ts
-                ms['damage_in'] += dmg
-                ms['hits_in']   += 1
                 self.last_active_mob    = src
                 self.last_active_mob_ms = ts
-                # Track damage by type so the Mob Stats panel can show
-                # exactly what schools each mob hits us with.
-                ms['in_types'][cat] = ms['in_types'].get(cat, 0) + dmg
+                # Numeric accounting only when the DMG feed isn't live -
+                # while it is, DMG-to-player events own incoming attribution
+                # (via the entity ledger) and text would double-count.
+                if not dmg_live:
+                    ms['damage_in'] += dmg
+                    ms['hits_in']   += 1
+                    ms['in_types'][cat] = ms['in_types'].get(cat, 0) + dmg
             if not dmg_live:
                 elapsed = (ts - self.in_session.start_ms) / 1000.0
                 cat_tag = f" [{cat}]" if msg else ""

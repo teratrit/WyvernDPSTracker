@@ -42,7 +42,7 @@ OP_STAT_UPDATE    = 120
 OP_CLIENT_ACTION  = 124
 
 # PERFORM_CLIENT_ACTION sub-opcodes we care about. SHOW_DAMAGE is the floating
-# combat text feed: JSON {id, dmg, type, crit, heal} — exact damage with target
+# combat text feed: JSON {id, dmg, type, crit, heal} - exact damage with target
 # entityId, damage-type string and server-authoritative crit flag.
 ACTION_SHOW_DAMAGE = 16
 ACTION_DEBUFFS = {3: ('petrify', True),   4: ('petrify', False),
@@ -58,7 +58,7 @@ DEFLATED_OPCODES = {8, 9, 12, 17, 19, 24, 35, 42, 51, 52, 60, 70, 72, 90,
 # Bytes to skip before the struct in a NON-deflated payload (i32 length).
 PLAIN_STRUCT_OFFSET = 4
 # Bytes to skip before the zlib stream in a deflated payload (i32 length +
-# i32 uncompressed size). Verified against live capture.
+# i32 uncompressed size).
 DEFLATE_HEADER_OFFSET = 8
 
 STYLE_DAMAGE = 3   # incoming (red)
@@ -205,7 +205,7 @@ class FrameBuffer:
             opcode = int.from_bytes(self.buf[0:4], 'big', signed=True)
             length = int.from_bytes(self.buf[4:8], 'big', signed=True)
             if length < 0 or length > MAX_FRAME_LEN:
-                # Desynced — drop the buffer rather than poison every
+                # Desynced - drop the buffer rather than poison every
                 # subsequent parse.
                 self.buf = b''
                 self.desynced = True
@@ -276,9 +276,10 @@ class WebCapture:
         self._ws = None
         self._msg_id = 0
         self._shutdown = False
-        # All binary sockets are decoded (per-requestId buffers isolate them,
-        # and non-game streams die as contained desync/decode errors). A URL
-        # allowlist here went deaf on MIGRATE redials to new hosts.
+        # All binary sockets are decoded - the server can MIGRATE the game
+        # to a new host mid-session, so a URL allowlist can't be trusted.
+        # Per-requestId buffers isolate streams; non-game ones die as
+        # contained desync/decode errors.
         self._buffers = {}          # requestId -> FrameBuffer
         # HP pairing state (port of DPSAgent.onHpReading)
         self._last_hp = -1
@@ -296,7 +297,7 @@ class WebCapture:
         # HP-drop INs are held briefly: the matching DMG-to-player floating
         # text arrives a few ms later and is the authoritative (typed) record
         # of the same hit. Only drops with no match within PENDING_IN_MS
-        # (DOTs, drains — no floating text) are emitted as IN.
+        # (DOTs, drains - no floating text) are emitted as IN.
         self._pending_ins = []          # [{'dmg', 'msg', 'ts'}]
 
     # -- lifecycle --
@@ -338,7 +339,7 @@ class WebCapture:
         self._buffers = {}
         # Reset per-connection game state: after a capture gap the old HP
         # anchor would emit one giant fabricated IN/HEAL, and the player
-        # entity id may have changed (respawn/server migration) — a stale id
+        # entity id may have changed (respawn/server migration) - a stale id
         # silently inverts damage direction downstream. Re-detection takes a
         # couple of hits and re-emits PLAYER.
         self._last_hp = -1
@@ -460,7 +461,7 @@ class WebCapture:
             self.write_event(
                 'DMG', f'{eid}|{int(dmg)}|{dtype}|{int(crit)}|{int(heal)}')
             # This floating-text hit supersedes the HP-drop IN for the same
-            # damage — cancel the held IN so the GUI doesn't count it twice.
+            # damage - cancel the held IN so the GUI doesn't count it twice.
             if not heal and self._player_entity and eid == self._player_entity:
                 now = time.time() * 1000
                 for p in self._pending_ins:
@@ -539,18 +540,18 @@ class WebCapture:
                 self.write_event('OUT', f'{dmg.group(1)}|{line}')
             return
 
-        # Neither style but looks like a damage line — surface it so gaps in
+        # Neither style but looks like a damage line - surface it so gaps in
         # the style mapping show up in the log during live testing.
         if DAMAGE_RE.search(line):
             self.write_event('DBG', f'unstyled_damage|{style}|{line}')
 
     # Port of DPSAgent.onHpReading: incoming damage = HP drop, paired with
     # the last red-styled line if it arrived within 500 ms. HP rises are
-    # healing (regen/potions/spells) — reported as HEAL events unless maxHp
+    # healing (regen/potions/spells) - reported as HEAL events unless maxHp
     # changed in the same update (level-up/buff/drain shifts the baseline,
     # not a heal or a hit). Drops are held briefly and suppressed when the
     # matching DMG-to-player floating text arrives (it is the authoritative
-    # typed record of the same hit — emitting both double-counted).
+    # typed record of the same hit - emitting both double-counted).
     def _on_hp(self, hp, max_hp=None):
         prev = self._last_hp
         max_changed = max_hp is not None and max_hp != self._last_max_hp

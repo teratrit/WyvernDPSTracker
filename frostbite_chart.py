@@ -1,4 +1,4 @@
-"""Frostbite duration vs water skill — including sigmoid (diminishing-returns) fit."""
+"""Frostbite duration vs water skill - including sigmoid (diminishing-returns) fit."""
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
@@ -19,7 +19,7 @@ popt, _ = curve_fit(sigmoid, skills, durs, p0=p0, maxfev=20000)
 L, k, x0, b0 = popt
 
 # Diagnostic prints
-print(f"quadratic:  y = {a:.5f}x² + {b:.4f}x + {c:.3f}")
+print(f"quadratic:  y = {a:.5f}x^2 + {b:.4f}x + {c:.3f}")
 print(f"sigmoid:    L={L:.2f} k={k:.3f} x0={x0:.2f} b0={b0:.3f}")
 print(f"sigmoid plateau (x->inf): {L + b0:.2f}s")
 
@@ -51,7 +51,7 @@ ax2.plot(x_far, a*x_far**2 + b*x_far + c,
 ax2.plot(x_far, sigmoid(x_far, *popt),
          color='crimson', lw=1.5, label='sigmoid')
 ax2.axhline(L + b0, color='crimson', lw=0.7, ls=':',
-            label=f'sigmoid plateau ≈ {L+b0:.1f}s')
+            label=f'sigmoid plateau ~ {L+b0:.1f}s')
 ax2.scatter(skills, durs, s=40, color='black', zorder=5)
 ax2.set_xlabel('water skill')
 ax2.set_title('extrapolated to skill 110', fontsize=11)
@@ -60,7 +60,7 @@ ax2.spines['top'].set_visible(False); ax2.spines['right'].set_visible(False)
 ax2.legend(loc='upper left', frameon=False, fontsize=9)
 ax2.set_xlim(45, 110); ax2.set_ylim(0, 30)
 
-fig.suptitle('Frostbite duration — quadratic vs sigmoid', fontsize=12, y=1.01)
+fig.suptitle('Frostbite duration - quadratic vs sigmoid', fontsize=12, y=1.01)
 plt.tight_layout()
 
 out = Path(__file__).parent / 'frostbite_chart_v3.png'

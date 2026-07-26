@@ -3,10 +3,10 @@ Per-mob resistance / weakness inference from observed combat logs.
 
 For each (mob, damage_school) pair, computes mean damage you dealt. Compares to
 the global baseline (your average for that school across all mobs). Ratios:
-  ratio < 0.6  → resistant
-  ratio < 0.4  → strongly resistant
-  ratio > 1.4  → weak
-  ratio > 1.6  → strongly weak
+  ratio < 0.6  -> resistant
+  ratio < 0.4  -> strongly resistant
+  ratio > 1.4  -> weak
+  ratio > 1.6  -> strongly weak
 
 Output: a per-mob table, plus a top-resistances and top-weaknesses summary.
 Conservative: requires n>=15 hits per (mob, school) before reporting a ratio.

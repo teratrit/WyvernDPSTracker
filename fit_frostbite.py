@@ -16,7 +16,7 @@ def report(name, predict_fn):
 # 1. Pure quadratic least-squares
 coeffs = np.polyfit(skills, durs, 2)
 a, b, c = coeffs
-print(f"Least-squares quadratic: y = {a:.5f}·x² + {b:.4f}·x + {c:.2f}")
+print(f"Least-squares quadratic: y = {a:.5f}*x^2 + {b:.4f}*x + {c:.2f}")
 report("quadratic", lambda s: a*s*s + b*s + c)
 
 # 2. Pure cubic (exact through 4 points)
@@ -24,7 +24,7 @@ coeffs3 = np.polyfit(skills, durs, 3)
 print(f"Cubic (exact 4-point): {coeffs3}")
 report("cubic", lambda s: np.polyval(coeffs3, s))
 
-# 3. Piecewise: base for skill ≤ 61, base×1.5 for skill ≥ 65
+# 3. Piecewise: base for skill <= 61, basex1.5 for skill >= 65
 def piecewise(s):
     base = (s - 14) / 10
     if s <= 61:
@@ -34,12 +34,12 @@ def piecewise(s):
     # interpolate linearly between (61, 4.7) and (65, 6.8)
     t = (s - 61) / 4
     return 4.7 + t * (6.8 - 4.7)
-report("piecewise (base / linear / base×1.5)", piecewise)
+report("piecewise (base / linear / basex1.5)", piecewise)
 
 # 4. Power-law (least-squares in log space)
 log_s = np.log(skills)
 log_d = np.log(durs)
 b_pow, log_a = np.polyfit(log_s, log_d, 1)
 a_pow = np.exp(log_a)
-print(f"Power-law: y = {a_pow:.4e} · x^{b_pow:.3f}")
+print(f"Power-law: y = {a_pow:.4e} * x^{b_pow:.3f}")
 report("power-law", lambda s: a_pow * s**b_pow)

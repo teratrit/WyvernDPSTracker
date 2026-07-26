@@ -7,7 +7,7 @@ kill counts, and per-mob stats with wiki export.
 v2.0 reads the game's own combat data feed instead of parsing chat text: every
 hit arrives with its damage type (fire, cold, shock, cut, stab, smash, holy,
 poison, magic, ...), the exact target, and a crit flag. Incoming damage is
-typed too. `hitmsgs` can stay off for DPS tracking — turn it on only if you
+typed too. `hitmsgs` can stay off for DPS tracking - turn it on only if you
 want per-mob name stats and the wiki export.
 
 ## Download
@@ -16,28 +16,19 @@ Grab `WyvernDPSTracker.exe` from the [latest release](https://github.com/teratri
 
 ## Requirements
 
-- Wyvern on Steam (the current Electron client), OR any Chromium browser
-  (Chrome/Edge) for play.ghosttrack.com. No JDK needed anymore.
+- Wyvern on Steam (the current client). No JDK needed anymore.
 
 ## Usage
 
-**Steam (recommended one-time setup):** add
-`--remote-debugging-port=9222` to Wyvern's Steam launch options
-(Library > Wyvern > Properties > Launch Options). The tracker then binds
-to your already-running game every time.
+One-time setup: add `--remote-debugging-port=9222` to Wyvern's Steam
+launch options (Library > Wyvern > Properties > Launch Options). The
+tracker then binds to your already-running game every time.
 
 1. Run `WyvernDPSTracker.exe`
-2. It binds to the running game. Without the launch option set, it can't
-   attach to an already-running game (a debugger can only attach to a
-   process started with the debug port) — it will show the setup
-   instructions and offer to relaunch the game itself.
-3. Fight stuff
-
-**Browser:**
-1. Run `WyvernDPSTracker.exe --browser`
-2. The tracker opens Chrome/Edge with its own profile at
-   play.ghosttrack.com — log in there (remembered between runs) and play.
-   The `--browser` flag also skips the Steam client when both are installed.
+2. It binds to the running game. Without the launch option it can't
+   attach to a game that's already open (debuggers only attach to
+   processes started with the debug port) - it'll show the setup steps
+   and offer to relaunch the game itself.
 3. Fight stuff
 
 Sessions auto-start when you deal or take damage and auto-end after quiet

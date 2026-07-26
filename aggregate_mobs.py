@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 # Reuse the live tracker's parsing + formatting logic. Keeps a single source
-# of truth for verbs/regexes/wiki layout — no copy-paste drift.
+# of truth for verbs/regexes/wiki layout - no copy-paste drift.
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -162,12 +162,12 @@ def main():
         fname = safe_filename(mob) + '.txt'
         (out_dir / fname).write_text(markup + "\n", encoding='utf-8')
 
-    # Index file — sorted by total samples
+    # Index file - sorted by total samples
     rows = sorted(
         mob_stats.items(),
         key=lambda x: -(x[1]['hits'] + x[1]['hits_in']))
     idx_lines = [
-        f"# Wyvern mob aggregation — {len(mob_stats)} mobs from {len(paths)} log files",
+        f"# Wyvern mob aggregation - {len(mob_stats)} mobs from {len(paths)} log files",
         "",
         f"{'Mob':<32} {'Out hits':>9} {'In hits':>8} {'Kills':>6} {'Encounters':>11} {'XP samp':>8}",
         "-" * 80,

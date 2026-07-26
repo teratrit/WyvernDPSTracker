@@ -3,7 +3,7 @@ Compare observed mob stats (from logs) against the published Wyvern wiki.
 
 For each mob you've fought enough times, fetches the wiki page from
 http://wiki.wyvernsource.com, parses HP / XP fields out of the page text,
-and prints only the mismatches. Read-only — never edits anything.
+and prints only the mismatches. Read-only - never edits anything.
 
 Usage:
     python analyze_wiki_diff.py [--logs-dir DIR] [--mob NAME] [--min-kills 30]

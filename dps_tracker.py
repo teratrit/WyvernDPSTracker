@@ -163,9 +163,9 @@ RIVES_FLESH_RE = re.compile(r'\brive[ds]?\s+your\s+flesh\b', re.I)
 RIPS_FLESH_RE  = re.compile(r'\brips?\s+(?:away\s+)?flesh\b', re.I)
 
 # Incoming "You feel ..." status lines - these ARE real damage:
-#  • "You feel sick." → poison DOT ticking
-#  • "You suddenly feel very hot!" → fire-recoil from hitting a fire-aligned mob
-#  • "You suddenly feel very cold!" → cold-recoil from hitting a cold-aligned mob
+#  * "You feel sick." -> poison DOT ticking
+#  * "You suddenly feel very hot!" -> fire-recoil from hitting a fire-aligned mob
+#  * "You suddenly feel very cold!" -> cold-recoil from hitting a cold-aligned mob
 FEEL_TYPES = {
     'sick': 'Poison',
     'hot':  'Fire',
@@ -523,7 +523,7 @@ def _trim_text_widget(widget, max_lines):
 def _format_in_types(types_dict, total):
     """Format the in_types dict as 'Cold 60% / Smash 40%', top 2 above 5%."""
     if not types_dict or total <= 0:
-        return '—'
+        return '-'
     items = sorted(types_dict.items(), key=lambda x: -x[1])
     parts = []
     for cat, dmg in items[:3]:
@@ -531,7 +531,7 @@ def _format_in_types(types_dict, total):
         if pct < 5 and parts:
             break
         parts.append(f'{cat} {pct:.0f}%')
-    return ' / '.join(parts) if parts else '—'
+    return ' / '.join(parts) if parts else '-'
 
 
 def _new_mob_record():
@@ -578,7 +578,7 @@ class DPSTrackerGUI:
         #   first_seen_ms / last_seen_ms   - for time-spent
         self.mob_stats = defaultdict(_new_mob_record)
         # Active "encounter" damage tally per mob (closed on KILL, discarded on idle).
-        self.active_encounters = {}   # mob_name → {'damage': int, 'last_ts': int}
+        self.active_encounters = {}   # mob_name -> {'damage': int, 'last_ts': int}
         self.last_killed_mob = None
         self.last_kill_ms    = 0
         # Death forensics ring buffer - last few seconds of events leading up to death
@@ -663,7 +663,7 @@ class DPSTrackerGUI:
             row.pack(fill=tk.X, padx=8)
             tk.Label(row, text=key, fg='#7d8590', bg='#161b22',
                      font=sm, width=14, anchor='w').pack(side=tk.LEFT)
-            v = tk.Label(row, text="—", fg='#c9d1d9', bg='#161b22', font=sm, anchor='e')
+            v = tk.Label(row, text="-", fg='#c9d1d9', bg='#161b22', font=sm, anchor='e')
             v.pack(side=tk.RIGHT)
             self.time_labels[key] = v
 
@@ -672,7 +672,7 @@ class DPSTrackerGUI:
         ef.pack(fill=tk.X, padx=12, pady=(4, 0))
         tk.Label(ef, text="EXP", fg='#d2a8ff', bg='#0d1117',
                  font=lbl, anchor='w').pack(side=tk.LEFT)
-        self.exp_rate_lbl = tk.Label(ef, text="— XP/hr", fg='#484f58',
+        self.exp_rate_lbl = tk.Label(ef, text="- XP/hr", fg='#484f58',
                                      bg='#0d1117', font=big, anchor='e')
         self.exp_rate_lbl.pack(side=tk.RIGHT)
 
@@ -762,12 +762,12 @@ class DPSTrackerGUI:
 
         row1 = tk.Frame(win, bg='#0d1117'); row1.pack(fill=tk.X, padx=8, pady=(6, 0))
         tk.Label(row1, text="DPS",  fg='#7d8590', bg='#0d1117', font=sm).pack(side=tk.LEFT)
-        self._mini_dps = tk.Label(row1, text="—", fg='#3fb950', bg='#0d1117', font=big)
+        self._mini_dps = tk.Label(row1, text="-", fg='#3fb950', bg='#0d1117', font=big)
         self._mini_dps.pack(side=tk.RIGHT)
 
         row2 = tk.Frame(win, bg='#0d1117'); row2.pack(fill=tk.X, padx=8)
         tk.Label(row2, text="XP/hr", fg='#7d8590', bg='#0d1117', font=sm).pack(side=tk.LEFT)
-        self._mini_xphr = tk.Label(row2, text="—", fg='#d2a8ff', bg='#0d1117', font=sm)
+        self._mini_xphr = tk.Label(row2, text="-", fg='#d2a8ff', bg='#0d1117', font=sm)
         self._mini_xphr.pack(side=tk.RIGHT)
 
         row3 = tk.Frame(win, bg='#0d1117'); row3.pack(fill=tk.X, padx=8)
@@ -807,13 +807,13 @@ class DPSTrackerGUI:
             self._mini_dps.config(text=f"{dps:.0f}",
                 fg='#3fb950' if dps >= 100 else '#58a6ff')
         else:
-            self._mini_dps.config(text="—", fg='#484f58')
+            self._mini_dps.config(text="-", fg='#484f58')
         # XP/hr - same calc as main panel
         rate = self._xp_rate()
         if rate:
             self._mini_xphr.config(text=f"{rate:,.0f}")
         else:
-            self._mini_xphr.config(text="—")
+            self._mini_xphr.config(text="-")
         self._mini_kills.config(text=str(self.kill_count))
         top = self.out_session.max_hit if self.out_session else 0
         self._mini_top.config(text=f"{top:,}" if top else "0")
@@ -826,7 +826,7 @@ class DPSTrackerGUI:
             return
 
         win = tk.Toplevel(self.root)
-        win.title("Mob Stats — Live")
+        win.title("Mob Stats - Live")
         win.configure(bg='#0d1117')
         win.geometry('1100x540')
         win.protocol('WM_DELETE_WINDOW', self._close_mob_stats)
@@ -949,7 +949,7 @@ class DPSTrackerGUI:
         recent = [e for e in self.event_ring if e[0] >= window_start]
         bar = "─" * 60
         self._write_history(bar, 'info')
-        self._write_history(f" DEATH — {datetime.fromtimestamp(death_ts/1000.0).strftime('%H:%M:%S')}", 'in')
+        self._write_history(f" DEATH - {datetime.fromtimestamp(death_ts/1000.0).strftime('%H:%M:%S')}", 'in')
         if death_msg:
             self._write_history(f"   {death_msg}", 'in')
         self._write_history(bar, 'info')
@@ -994,7 +994,7 @@ class DPSTrackerGUI:
         body_tag = 'out' if direction == 'out' else 'in'
 
         self._write_history(bar, 'info')
-        self._write_history(f" {tstr}  {label}  —  {dur_str}", 'hdr')
+        self._write_history(f" {tstr}  {label} - {dur_str}", 'hdr')
         self._write_history(bar, 'info')
         self._write_history(f"  Damage      {session.total:>10,}", body_tag)
         self._write_history(f"  DPS         {session.dps:>10.1f}", body_tag)
@@ -1076,7 +1076,7 @@ class DPSTrackerGUI:
         hdr.pack(fill=tk.X, padx=12, pady=(6, 0))
         tk.Label(hdr, text=title, fg=color, bg='#0d1117',
                  font=lbl, anchor='w').pack(side=tk.LEFT)
-        dps_lbl = tk.Label(hdr, text="— DPS", fg='#484f58', bg='#0d1117',
+        dps_lbl = tk.Label(hdr, text="- DPS", fg='#484f58', bg='#0d1117',
                            font=big, anchor='e')
         dps_lbl.pack(side=tk.RIGHT)
 
@@ -1160,11 +1160,10 @@ class DPSTrackerGUI:
         KILL line. By then the dead entity has stopped receiving damage while
         AoE survivors kept taking hits, so 'no damage after the kill' singles
         out the right entity. 300ms grace covers in-flight hits."""
-        # Settle all due kills together with closest-match assignment. Chain
-        # kills <300ms apart share candidates: picking the FRESHEST entity
-        # gave kill A the entity killed by B (its killing blow lands inside
-        # A's grace window) - confirmed swaps in live logs. Closest |last_ts
-        # - kill_ts| pairs each kill with its own entity.
+        # Closest |last_ts - kill_ts| match, not freshest-first: chain kills
+        # under ~300ms share candidates, and freshest-first hands kill A the
+        # entity that B killed (B's killing blow lands inside A's grace
+        # window).
         due = []
         while self.pending_kills and now - self.pending_kills[0][1] > 1200:
             due.append(self.pending_kills.popleft())
@@ -1202,7 +1201,7 @@ class DPSTrackerGUI:
         if not session or session.count == 0:
             # Clear every stat so stale numbers from a prior session don't leak
             # into what looks like the current one.
-            dps_lbl.config(text="— DPS", fg='#484f58')
+            dps_lbl.config(text="- DPS", fg='#484f58')
             for key in ("Damage", "Hits", "Avg", "Max"):
                 stats[key].config(text="0")
             for extra in ("Backstab", "Healed", "Net HP"):
@@ -1233,7 +1232,7 @@ class DPSTrackerGUI:
                 bs_pct = session.backstab_total / session.total * 100 if session.total else 0
                 bs_avg = session.backstab_total / session.backstab_count
                 stats["Backstab"].config(
-                    text=f"{session.backstab_count}× ({bs_pct:.0f}% / avg {bs_avg:.0f})")
+                    text=f"{session.backstab_count}x ({bs_pct:.0f}% / avg {bs_avg:.0f})")
                 if not bs_row.winfo_ismapped():
                     bs_row.pack(fill=tk.X, padx=8)
             else:
@@ -1574,14 +1573,12 @@ class DPSTrackerGUI:
             # the original event time, not wall-clock-now (would inflate rate).
             if self.exp_start_ms == 0:
                 self.exp_start_ms = ts
-            # XP only counts once it pairs with a kill. Unpaired receipts
-            # exist and can be enormous - a death-penalty recovery of 6M XP
-            # was observed, 19x a whole session's kill XP - and would wreck
-            # Total XP / XP-hr if credited.
-            # The web feed sends EXP just BEFORE its KILL line, so normally
-            # the amount is held for the next KILL to consume. The old
-            # ordering (KILL then EXP, seen in v1 log replays) is covered by
-            # attributing directly when the last kill is fresh and unpaid.
+            # Only kill-paired XP counts - death-penalty recovery hands back
+            # millions of XP in one line and would trash Total XP and XP/hr.
+            # The server sends EXP just BEFORE its KILL line, so the amount
+            # is held for the next KILL to consume; the old KILL-then-EXP
+            # ordering (v1 logs) is covered by attributing directly when the
+            # last kill is fresh and unpaid.
             if (self.last_killed_mob and not self.last_kill_xp_done and
                     ts - self.last_kill_ms < 2000):
                 ms = self.mob_stats[self.last_killed_mob]
@@ -1681,7 +1678,7 @@ class DPSTrackerGUI:
 
         self._log("", 'info')
         self._log("─" * 52, 'info')
-        self._log(f" SESSION SUMMARY — {dur}", 'kill')
+        self._log(f" SESSION SUMMARY - {dur}", 'kill')
         self._log("─" * 52, 'info')
 
         # EXP block
@@ -1723,13 +1720,13 @@ class DPSTrackerGUI:
         self.exp_labels["Total XP"].config(text=f"{self.exp_total:,}")
         self.exp_labels["Kills"].config(text=str(self.kill_count))
         if self.exp_total <= 0 or not self.exp_start_ms:
-            self.exp_rate_lbl.config(text="— XP/hr", fg='#484f58')
+            self.exp_rate_lbl.config(text="- XP/hr", fg='#484f58')
             return
         elapsed_s = self._xp_elapsed_s()
         # Don't report a rate until tracking has run for at least 10 seconds -
         # prevents burst kills in the first few seconds from spiking the rate.
         if elapsed_s < 10:
-            self.exp_rate_lbl.config(text="… XP/hr", fg='#7d8590')
+            self.exp_rate_lbl.config(text="... XP/hr", fg='#7d8590')
         else:
             life_rate = self._xp_rate(elapsed_s)
             self.exp_rate_lbl.config(
@@ -1758,8 +1755,8 @@ class DPSTrackerGUI:
         self.pending_kills.clear()
         self.pending_xp = None
         self.last_kill_xp_done = True
-        self.time_labels["Session Start"].config(text="—")
-        self.time_labels["Duration"].config(text="—")
+        self.time_labels["Session Start"].config(text="-")
+        self.time_labels["Duration"].config(text="-")
         self.last_active_mob    = None
         self.last_active_mob_ms = 0
         self.backstab_pending_until_ms = 0
@@ -1767,7 +1764,7 @@ class DPSTrackerGUI:
         # so the user can review past sessions/deaths after wiping live state.
         self.exp_labels["Total XP"].config(text="0")
         self.exp_labels["Kills"].config(text="0")
-        self.exp_rate_lbl.config(text="— XP/hr", fg='#484f58')
+        self.exp_rate_lbl.config(text="- XP/hr", fg='#484f58')
         self.toggle_btn.config(text="Start (F12)", bg='#238636')
         self.log.config(state=tk.NORMAL)
         self.log.delete('1.0', tk.END)
@@ -1847,7 +1844,7 @@ def client_pids():
 def _pid_alive(pid):
     """Windows-only: check if a process with the given PID is still running."""
     if not pid:
-        return True  # Unknown PID — be permissive, don't self-close
+        return True  # Unknown PID - be permissive, don't self-close
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     STILL_ACTIVE = 259
     handle = ctypes.windll.kernel32.OpenProcess(
@@ -1882,61 +1879,6 @@ def _make_event_writer(log_path):
     return write_event
 
 
-GAME_URL = "https://play.ghosttrack.com/game"
-
-# Chromium-based browsers we can drive for browser play, in preference order.
-_BROWSER_CANDIDATES = [
-    ("Chrome", [
-        Path(os.environ.get('ProgramFiles', 'C:/Program Files'))
-        / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)'))
-        / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get('LOCALAPPDATA', ''))
-        / "Google/Chrome/Application/chrome.exe",
-    ]),
-    ("Edge", [
-        Path(os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)'))
-        / "Microsoft/Edge/Application/msedge.exe",
-        Path(os.environ.get('ProgramFiles', 'C:/Program Files'))
-        / "Microsoft/Edge/Application/msedge.exe",
-    ]),
-]
-
-
-def find_browser_exe():
-    """(name, path) of an installed Chromium browser, or (None, None)."""
-    for name, paths in _BROWSER_CANDIDATES:
-        for p in paths:
-            if p.exists():
-                return name, p
-    return None, None
-
-
-def launch_browser_client(port=CDP_PORT):
-    """Launch Chrome/Edge with the debug port on the game URL.
-
-    Modern Chrome only honors --remote-debugging-port together with a
-    non-default --user-data-dir, so the tracker keeps its own browser profile
-    (game login persists there between runs).
-
-    Returns the Popen process, or an error string.
-    """
-    name, exe = find_browser_exe()
-    if not exe:
-        return "No Chrome or Edge installation found for browser play."
-    profile = Path(os.environ.get('LOCALAPPDATA', str(_run_dir()))) \
-        / "WyvernDPSTracker" / "browser-profile"
-    profile.mkdir(parents=True, exist_ok=True)
-    print(f"Launching {name} (tracker profile) at {GAME_URL}...")
-    return subprocess.Popen([
-        str(exe),
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={profile}",
-        "--no-first-run",
-        GAME_URL,
-    ])
-
-
 def _find_game_port():
     """First debug port that actually has a GAME page on it, or 0.
 
@@ -1959,10 +1901,10 @@ def _free_launch_port():
     return CDP_PORT
 
 
-def attach_web(prefer_browser=False):
-    """Attach to the game via CDP — the Steam Electron client or a Chromium
-    browser playing play.ghosttrack.com — binding to an existing debug-enabled
-    game when there is one, launching one only when there isn't.
+def attach_web():
+    """Attach to the Steam client via CDP - binding to an existing
+    debug-enabled game when there is one, launching one only when there
+    isn't.
 
     Returns True on success, or an error string for main() to print.
     """
@@ -1976,7 +1918,7 @@ def attach_web(prefer_browser=False):
     port = _find_game_port()
     if not port:
         running = client_pids()
-        if running and not prefer_browser:
+        if running:
             print("Wyvern is running but wasn't started with the debug port,")
             print("so the tracker can't bind to it.")
             print()
@@ -1999,21 +1941,15 @@ def attach_web(prefer_browser=False):
 
         if not port:
             launch_port = _free_launch_port()
-            steam_exe = None if prefer_browser else find_client_exe()
-            if steam_exe:
-                print(f"Launching {steam_exe.name} with debug port {launch_port}...")
-                proc = subprocess.Popen(
-                    [str(steam_exe), f"--remote-debugging-port={launch_port}"],
-                    cwd=str(steam_exe.parent))
-                GAME_PID = proc.pid
-            else:
-                proc = launch_browser_client(launch_port)
-                if isinstance(proc, str):
-                    return proc
-                # No PID watch for browsers: the Chromium launcher process
-                # hands off and exits immediately, which would read as "game
-                # closed". The capture's CDP disconnect detection covers the
-                # browser actually closing.
+            steam_exe = find_client_exe()
+            if not steam_exe:
+                return ("Could not find the Steam Wyvern client "
+                        f"({CLIENT_EXE_NAME}). Is it installed?")
+            print(f"Launching {steam_exe.name} with debug port {launch_port}...")
+            proc = subprocess.Popen(
+                [str(steam_exe), f"--remote-debugging-port={launch_port}"],
+                cwd=str(steam_exe.parent))
+            GAME_PID = proc.pid
             deadline = time.time() + 30
             while time.time() < deadline:
                 if web_capture.cdp_alive(launch_port):
@@ -2023,7 +1959,7 @@ def attach_web(prefer_browser=False):
             else:
                 return "Client launched but its debug port never came up."
 
-    if not GAME_PID and not prefer_browser:
+    if not GAME_PID:
         pids = client_pids()
         if pids:
             GAME_PID = pids[0]
@@ -2046,7 +1982,7 @@ def main():
         input("Press Enter to close...")
         sys.exit(1)
 
-    result = attach_web(prefer_browser='--browser' in sys.argv)
+    result = attach_web()
     if result is not True:
         print("\nCould not attach to game.")
         if isinstance(result, str):

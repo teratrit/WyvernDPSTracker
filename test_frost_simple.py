@@ -84,4 +84,4 @@ print()
 
 expected = [3200, 1400, 700]
 ok = samples == expected and start == 0 and last == 0
-print("PASS" if ok else f"FAIL — expected {expected}, trailing 0/0")
+print("PASS" if ok else f"FAIL - expected {expected}, trailing 0/0")

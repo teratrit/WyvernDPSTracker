@@ -167,6 +167,15 @@ def test_debuff_cycle():
                       ('DEBUFF', 'poison|STOP|0')], events
 
 
+def test_heal_events():
+    cap, events = make_capture()
+    feed(cap,
+         frame(OP_STAT_UPDATE, stat_update(80, 100)),
+         frame(OP_STAT_UPDATE, stat_update(95, 100)),   # regen tick -> HEAL 15
+         frame(OP_STAT_UPDATE, stat_update(120, 150)))  # level up -> no HEAL
+    assert events == [('HEAL', '15')], events
+
+
 def test_backstab_and_death():
     cap, events = make_capture()
     feed(cap,

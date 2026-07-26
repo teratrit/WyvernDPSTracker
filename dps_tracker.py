@@ -419,6 +419,9 @@ class Session:
     # Server-authoritative crits (only populated by the DMG feed).
     crit_count:     int   = 0
     crit_total:     int   = 0
+    # HP gained while this (incoming) session was active - regen, potions,
+    # heals. Lets the INCOMING panel show net HP flow.
+    healed:         int   = 0
 
     @property
     def elapsed_s(self):
@@ -601,6 +604,11 @@ class DPSTrackerGUI:
         # mob stats working with hitmsgs off and keys concurrent same-name
         # mobs separately.
         self.entity_stats = {}
+        # Kills awaiting entity attribution. Under AoE several entities are
+        # hit in the same volley, so "freshest entity" at KILL time is often a
+        # survivor. Instead we wait ~1s: the entity that stops receiving
+        # damage at the kill is the one that died.
+        self.pending_kills = deque()   # (mob_name, kill_ts)
         self._shutdown   = False
         self._build_ui()
         self._start_log_reader()
@@ -634,7 +642,8 @@ class DPSTrackerGUI:
             "OUTGOING", '#3fb950', big, lbl, sm,
             extra_stats=["Backstab"])
         self.in_dps,  self.in_stats,  self.in_bd  = self._build_section(
-            "INCOMING", '#f85149', big, lbl, sm)
+            "INCOMING", '#f85149', big, lbl, sm,
+            extra_stats=["Healed", "Net HP"])
 
         # Timing row
         tf = tk.Frame(self.root, bg='#161b22', bd=1, relief='groove')
@@ -990,6 +999,10 @@ class DPSTrackerGUI:
                 f"  Crits       {session.crit_count:>10,}  "
                 f"({crit_pct:.1f}% of hits, {session.crit_total:,} dmg)",
                 body_tag)
+        if direction == 'in' and session.healed > 0:
+            net = session.healed - session.total
+            self._write_history(f"  Healed      {session.healed:>10,}", body_tag)
+            self._write_history(f"  Net HP      {net:>+10,}", body_tag)
 
         if direction == 'out':
             if session.backstab_count > 0:
@@ -1062,7 +1075,7 @@ class DPSTrackerGUI:
         sf.pack(fill=tk.X, padx=12, pady=2)
         stats = {}
         # Stats that start hidden and appear only when there's data for them.
-        hidden_initially = {'Backstab'}
+        hidden_initially = {'Backstab', 'Healed', 'Net HP'}
         for key in ("Damage", "Hits", "Avg", "Max") + tuple(extra_stats or []):
             row = tk.Frame(sf, bg='#161b22')
             if key not in hidden_initially:
@@ -1106,6 +1119,8 @@ class DPSTrackerGUI:
             for m in stale:
                 del self.active_encounters[m]
 
+        self._settle_pending_kills(now)
+
         # Drop entity ledgers that went quiet without a KILL (fled, map
         # change, someone else's kill) so they can't be misattributed later.
         if self.entity_stats:
@@ -1131,6 +1146,31 @@ class DPSTrackerGUI:
 
         self.root.after(100, self._tick)
 
+    def _settle_pending_kills(self, now):
+        """Attribute entity damage ledgers to named kills, ~1.2s after the
+        KILL line. By then the dead entity has stopped receiving damage while
+        AoE survivors kept taking hits, so 'no damage after the kill' singles
+        out the right entity. 300ms grace covers in-flight hits."""
+        while self.pending_kills and now - self.pending_kills[0][1] > 1200:
+            mob, kill_ts = self.pending_kills.popleft()
+            cands = [e for e, es in self.entity_stats.items()
+                     if es['last_ts'] <= kill_ts + 300
+                     and kill_ts - es['last_ts'] < 5000]
+            if not cands:
+                continue
+            eid = max(cands, key=lambda e: self.entity_stats[e]['last_ts'])
+            es = self.entity_stats.pop(eid)
+            ms = self.mob_stats[mob]
+            ms['damage'] += es['damage']
+            ms['hits']   += es['hits']
+            ms['backstab_damage'] += es['backstab_damage']
+            ms['backstab_hits']   += es['backstab_hits']
+            for t, d in es['types'].items():
+                ms['out_types'][t] = ms['out_types'].get(t, 0) + d
+            # Exact damage-to-kill for this instance - an HP sample.
+            if es['damage'] > 0:
+                ms['encounter_damages'].append(es['damage'])
+
     def _refresh(self, session, dps_lbl, stats, bd, hi_color, mid_color):
         if not session or session.count == 0:
             # Clear every stat so stale numbers from a prior session don't leak
@@ -1138,10 +1178,11 @@ class DPSTrackerGUI:
             dps_lbl.config(text="— DPS", fg='#484f58')
             for key in ("Damage", "Hits", "Avg", "Max"):
                 stats[key].config(text="0")
-            if "Backstab" in stats:
-                bs_row = stats["Backstab"].master
-                if bs_row.winfo_ismapped():
-                    bs_row.pack_forget()
+            for extra in ("Backstab", "Healed", "Net HP"):
+                if extra in stats:
+                    row = stats[extra].master
+                    if row.winfo_ismapped():
+                        row.pack_forget()
             bd.config(state=tk.NORMAL)
             bd.delete('1.0', tk.END)
             bd.config(state=tk.DISABLED)
@@ -1171,6 +1212,23 @@ class DPSTrackerGUI:
             else:
                 if bs_row.winfo_ismapped():
                     bs_row.pack_forget()
+
+        if "Healed" in stats:
+            heal_row = stats["Healed"].master
+            net_row  = stats["Net HP"].master
+            if session.healed > 0:
+                net = session.healed - session.total
+                stats["Healed"].config(text=f"{session.healed:,}")
+                stats["Net HP"].config(
+                    text=f"{net:+,}",
+                    fg='#3fb950' if net >= 0 else '#f85149')
+                for row in (heal_row, net_row):
+                    if not row.winfo_ismapped():
+                        row.pack(fill=tk.X, padx=8)
+            else:
+                for row in (heal_row, net_row):
+                    if row.winfo_ismapped():
+                        row.pack_forget()
 
         bd.config(state=tk.NORMAL)
         bd.delete('1.0', tk.END)
@@ -1399,6 +1457,22 @@ class DPSTrackerGUI:
                 self.event_ring.append((ts, 'IN', dmg, cat, msg))
                 self._log(f"   IN {elapsed:6.2f}s {dmg:>5d}{cat_tag}", 'in')
 
+        elif etype == "HEAL":
+            if self._paused:
+                return
+            try:
+                amt = int(data)
+            except ValueError:
+                return
+            if amt <= 0:
+                return
+            # Healing counts toward the active incoming session so Net HP is
+            # damage-vs-regen over the same window. It deliberately does NOT
+            # open or extend a session - constant regen ticks would otherwise
+            # keep an INCOMING session alive forever.
+            if self.in_session and self.in_session.active:
+                self.in_session.healed += amt
+
         elif etype == "KILL":
             if not self._paused:
                 self.kill_count += 1
@@ -1412,26 +1486,9 @@ class DPSTrackerGUI:
                         ms['first_seen_ms'] = ts
                     self.last_killed_mob = mob
                     self.last_kill_ms    = ts
-                    # Entity attribution: the KILL line names the mob; the
-                    # entity ledger has its exact damage. The freshest entity
-                    # hit within the last 3s is the one that just died.
-                    eid = None
-                    if self.entity_stats:
-                        cand = max(self.entity_stats,
-                                   key=lambda e: self.entity_stats[e]['last_ts'])
-                        if ts - self.entity_stats[cand]['last_ts'] < 3000:
-                            eid = cand
-                    if eid is not None:
-                        es = self.entity_stats.pop(eid)
-                        ms['damage'] += es['damage']
-                        ms['hits']   += es['hits']
-                        ms['backstab_damage'] += es['backstab_damage']
-                        ms['backstab_hits']   += es['backstab_hits']
-                        for t, d in es['types'].items():
-                            ms['out_types'][t] = ms['out_types'].get(t, 0) + d
-                        # Exact damage-to-kill for this instance - an HP sample.
-                        if es['damage'] > 0:
-                            ms['encounter_damages'].append(es['damage'])
+                    # Entity attribution is deferred (see _settle_pending_kills)
+                    # so AoE volleys don't credit a surviving entity.
+                    self.pending_kills.append((mob, ts))
                     # Text-based encounter close (only accumulates when the
                     # DMG feed is not live).
                     enc = self.active_encounters.pop(mob, None)
@@ -1628,6 +1685,7 @@ class DPSTrackerGUI:
         self.event_ring.clear()
         self.xp_recent.clear()
         self.entity_stats.clear()
+        self.pending_kills.clear()
         self.last_active_mob    = None
         self.last_active_mob_ms = 0
         self.backstab_pending_until_ms = 0

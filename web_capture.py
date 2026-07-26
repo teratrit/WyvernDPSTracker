@@ -257,6 +257,7 @@ class WebCapture:
         self._buffers = {}          # requestId -> FrameBuffer
         # HP pairing state (port of DPSAgent.onHpReading)
         self._last_hp = -1
+        self._last_max_hp = -1
         self._pending_in_msg = None
         self._pending_in_ts = 0
         # Player entity detection: the DMG feed carries damage to every
@@ -393,9 +394,9 @@ class WebCapture:
             self._handle_text({1: style, 2: text})
         elif opcode == OP_STAT_UPDATE:
             stats = CompactReader(payload, PLAIN_STRUCT_OFFSET).read_struct()
-            hp = stats.get(1)
+            hp, max_hp = stats.get(1), stats.get(2)
             if isinstance(hp, int):
-                self._on_hp(hp)
+                self._on_hp(hp, max_hp if isinstance(max_hp, int) else None)
         elif opcode == OP_CLIENT_ACTION:
             action = CompactReader(payload, PLAIN_STRUCT_OFFSET).read_struct()
             self._handle_client_action(action)
@@ -489,11 +490,20 @@ class WebCapture:
             self.write_event('DBG', f'unstyled_damage|{style}|{line}')
 
     # Port of DPSAgent.onHpReading: incoming damage = HP drop, paired with
-    # the last red-styled line if it arrived within 500 ms.
-    def _on_hp(self, hp):
+    # the last red-styled line if it arrived within 500 ms. HP rises are
+    # healing (regen/potions/spells) — reported as HEAL events unless maxHp
+    # changed in the same update (level-up shifts the baseline, not a heal).
+    def _on_hp(self, hp, max_hp=None):
         prev = self._last_hp
+        max_changed = max_hp is not None and max_hp != self._last_max_hp
+        if max_hp is not None:
+            self._last_max_hp = max_hp
         self._last_hp = hp
-        if prev <= 0 or hp >= prev:
+        if prev <= 0 or hp == prev:
+            return
+        if hp > prev:
+            if not max_changed:
+                self.write_event('HEAL', str(hp - prev))
             return
         dmg = prev - hp
         msg = self._pending_in_msg

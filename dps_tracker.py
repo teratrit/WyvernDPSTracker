@@ -8,10 +8,8 @@ import atexit
 import ctypes
 import os
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import tkinter as tk
@@ -24,7 +22,7 @@ from pynput import keyboard as kb
 
 SCRIPT_DIR  = Path(__file__).parent.resolve()
 LOG_FILE    = SCRIPT_DIR / "dps_events_v2.log"
-GAME_PID    = 0   # PID of the Wyvern JVM we're attached to; 0 = unknown
+GAME_PID    = 0   # PID of the Wyvern client we watch; 0 = unknown
 SESSION_GAP = 15  # seconds of inactivity before session auto-ends
 
 # ── Damage categorization ─────────────────────────────────────────────────────
@@ -442,7 +440,10 @@ HITS_BUFFER_MAX = 5000
 BACKSTAB_TIMEOUT_MS = 2000
 # Time without seeing "(Frostbitten)" on a mob before we consider its
 # Frostbite debuff expired and record the duration.
-FROSTBITE_TIMEOUT_MS = 5000
+FROSTBITE_TIMEOUT_MS = 10000
+# Appended to on every closed Frostbite duration sample. One row per sample,
+# "<close_ts_ms>|<duration_ms>|<reason>", reason in {untagged, kill, timeout}.
+FROSTBITE_LOG_NAME   = 'frostbite_durations.log'
 
 
 @dataclass
@@ -472,6 +473,9 @@ class Session:
     normal_max:     int   = 0
     normal_mean:    float = 0.0
     normal_m2:      float = 0.0
+    # Server-authoritative crits (only populated by the DMG feed).
+    crit_count:     int   = 0
+    crit_total:     int   = 0
 
     @property
     def elapsed_s(self):
@@ -504,13 +508,16 @@ class Session:
             return 0.0
         return (self.normal_m2 / (self.normal_count - 1)) ** 0.5
 
-    def add(self, ts, damage, cat='Unknown', backstab=False):
+    def add(self, ts, damage, cat='Unknown', backstab=False, crit=False):
         if not self.start_ms:
             self.start_ms = ts
         self.hits.append((ts, damage, cat))
         self.total   += damage
         self.count   += 1
         self.max_hit  = max(self.max_hit, damage)
+        if crit:
+            self.crit_count += 1
+            self.crit_total += damage
         if backstab:
             self.backstab_count += 1
             self.backstab_total += damage
@@ -792,10 +799,20 @@ class DPSTrackerGUI:
         self.last_active_mob_ms = 0
         # Frostbite tracking, single-target assumption: we see "(Frostbitten)"
         # somewhere in chat, that's our active timer. First non-tagged player
-        # hit closes the sample.
+        # hit closes the sample. Closed samples are appended to both the
+        # in-memory deque (for the GUI panel) and frostbite_durations.log
+        # (for offline analysis - survives restarts).
         self.frostbite_start_ms = 0
         self.frostbite_last_ms  = 0
         self.frostbite_samples  = deque(maxlen=200)
+        self.frostbite_log_path = SCRIPT_DIR / FROSTBITE_LOG_NAME
+        # Web capture: our own entityId (from PLAYER event) and the last time
+        # a DMG-feed event arrived. While the DMG feed is live it is the
+        # authoritative source for session damage; OUT/IN text events then do
+        # bookkeeping only (mob names, verbs, frostbite) to avoid
+        # double-counting.
+        self.player_entity_id = 0
+        self.dmg_live_ms      = 0
         self._frost_win  = None
         self._frost_text = None
         self._shutdown   = False
@@ -999,6 +1016,27 @@ class DPSTrackerGUI:
         self._mini_kills.config(text=str(self.kill_count))
         top = self.out_session.max_hit if self.out_session else 0
         self._mini_top.config(text=f"{top:,}" if top else "0")
+
+    def _close_frostbite_sample(self, close_ts, reason):
+        """Close the currently rolling frostbite timer if any. Records the
+        duration to both the in-memory deque (GUI) and the persistent log
+        file (offline analysis). No-op if no timer is rolling or duration
+        is zero. `reason` is one of: untagged, kill, timeout."""
+        if not self.frostbite_start_ms:
+            return
+        dur = self.frostbite_last_ms - self.frostbite_start_ms
+        self.frostbite_start_ms = 0
+        self.frostbite_last_ms  = 0
+        if dur <= 0:
+            return
+        self.frostbite_samples.append(dur)
+        try:
+            with open(self.frostbite_log_path, 'a', encoding='utf-8') as fh:
+                fh.write(f"{close_ts}|{dur}|{reason}\n")
+        except OSError:
+            # Don't crash the tracker over a log write - the in-memory deque
+            # still has the sample for the GUI session.
+            pass
 
     def _show_frostbite(self):
         """Open the live Frostbite tracker, or bring it forward if already open."""
@@ -1334,6 +1372,12 @@ class DPSTrackerGUI:
         if session.count:
             self._write_history(f"  Avg hit     {session.avg:>10.0f}", body_tag)
         self._write_history(f"  Max hit     {session.max_hit:>10,}", body_tag)
+        if session.crit_count:
+            crit_pct = session.crit_count / session.count * 100
+            self._write_history(
+                f"  Crits       {session.crit_count:>10,}  "
+                f"({crit_pct:.1f}% of hits, {session.crit_total:,} dmg)",
+                body_tag)
 
         if direction == 'out':
             if session.backstab_count > 0:
@@ -1380,10 +1424,11 @@ class DPSTrackerGUI:
         self._write_history("", 'info')
 
     def _poll_game_alive(self):
-        """Close ourselves when the Wyvern JVM exits."""
+        """Close ourselves when the Wyvern client exits."""
         if self._shutdown:
             return
-        if GAME_PID and not _pid_alive(GAME_PID):
+        capture_dead = WEB_CAPTURE is not None and WEB_CAPTURE.disconnected
+        if capture_dead or (GAME_PID and not _pid_alive(GAME_PID)):
             # Print a final summary so the user sees their session before we close
             if not self._paused:
                 self._print_summary()
@@ -1456,11 +1501,7 @@ class DPSTrackerGUI:
         if self.frostbite_start_ms:
             latest_event_ms = max(self.last_out_ms, self.last_in_ms)
             if latest_event_ms and latest_event_ms - self.frostbite_last_ms > FROSTBITE_TIMEOUT_MS:
-                dur = self.frostbite_last_ms - self.frostbite_start_ms
-                if dur > 0:
-                    self.frostbite_samples.append(dur)
-                self.frostbite_start_ms = 0
-                self.frostbite_last_ms  = 0
+                self._close_frostbite_sample(self.frostbite_last_ms, 'timeout')
 
         self._refresh(self.out_session, self.out_dps, self.out_stats, self.out_bd, '#3fb950', '#58a6ff')
         self._refresh(self.in_session,  self.in_dps,  self.in_stats,  self.in_bd,  '#f85149', '#d29922')
@@ -1584,6 +1625,53 @@ class DPSTrackerGUI:
                 return
             self.backstab_pending_until_ms = ts + BACKSTAB_TIMEOUT_MS
 
+        elif etype == "PLAYER":
+            try:
+                self.player_entity_id = int(data)
+            except ValueError:
+                return
+            self._log(f"  Player entity identified: {data}", 'info')
+
+        elif etype == "DMG":
+            if self._paused:
+                return
+            parts = data.split('|')
+            if len(parts) < 5:
+                return
+            try:
+                eid, dmg = int(parts[0]), int(parts[1])
+            except ValueError:
+                return
+            if dmg <= 0 or parts[4] == '1':   # ignore heals for now
+                return
+            crit = parts[3] == '1'
+            cat  = parts[2].capitalize()
+            self.dmg_live_ms = ts
+
+            if self.player_entity_id and eid == self.player_entity_id:
+                if not self.in_session or not self.in_session.active:
+                    self._new_session('in')
+                self.in_session.add(ts, dmg, cat, crit=crit)
+                self.last_in_ms = ts
+                elapsed = (ts - self.in_session.start_ms) / 1000.0
+                self.event_ring.append((ts, 'IN', dmg, cat, f'entity {eid}'))
+                self._log(f"   IN {elapsed:6.2f}s {dmg:>5d} [{cat}]", 'in')
+            else:
+                is_backstab = ts <= self.backstab_pending_until_ms
+                if is_backstab:
+                    self.backstab_pending_until_ms = 0
+                if not self.out_session or not self.out_session.active:
+                    self._new_session('out')
+                    self._out_dummy = False
+                self.out_session.add(ts, dmg, cat,
+                                     backstab=is_backstab, crit=crit)
+                self.last_out_ms = ts
+                elapsed = (ts - self.out_session.start_ms) / 1000.0
+                self.event_ring.append((ts, 'OUT', dmg, cat, f'entity {eid}'))
+                tag = ' CRIT' if crit else (' BS' if is_backstab else '')
+                self._log(f"  OUT {elapsed:6.2f}s {dmg:>5d} [{cat}]{tag}", 'out')
+                self.status.config(text="Tracking...", fg='#3fb950')
+
         elif etype == "OUT":
             if self._paused:
                 return
@@ -1600,16 +1688,20 @@ class DPSTrackerGUI:
             # backstab flag - it's meant for the actual ninja swing.
             is_proc = msg.startswith('Justice ') or msg.startswith('Dream Eater ')
             is_backstab = (not is_proc) and ts <= self.backstab_pending_until_ms
-            if is_backstab:
-                self.backstab_pending_until_ms = 0
 
-            session_type_changed = self.out_session and self.out_session.active and (is_dummy != self._out_dummy)
-            if not self.out_session or not self.out_session.active or session_type_changed:
-                self._new_session('out')
-                self._out_dummy = is_dummy
+            # While the DMG feed is live it owns session damage (and consumes
+            # the backstab flag); the text line only does mob bookkeeping below.
+            dmg_live = ts - self.dmg_live_ms < 10000
+            if not dmg_live:
+                if is_backstab:
+                    self.backstab_pending_until_ms = 0
+                session_type_changed = self.out_session and self.out_session.active and (is_dummy != self._out_dummy)
+                if not self.out_session or not self.out_session.active or session_type_changed:
+                    self._new_session('out')
+                    self._out_dummy = is_dummy
 
-            self.out_session.add(ts, dmg, cat, backstab=is_backstab)
-            self.last_out_ms = ts
+                self.out_session.add(ts, dmg, cat, backstab=is_backstab)
+                self.last_out_ms = ts
             # Per-mob accounting
             mob = extract_mob_outgoing(msg)
             # Frostbite duration tracking. Single-target assumption: any chat
@@ -1621,11 +1713,7 @@ class DPSTrackerGUI:
                     self.frostbite_start_ms = ts
                 self.frostbite_last_ms = ts
             elif self.frostbite_start_ms:
-                dur = self.frostbite_last_ms - self.frostbite_start_ms
-                if dur > 0:
-                    self.frostbite_samples.append(dur)
-                self.frostbite_start_ms = 0
-                self.frostbite_last_ms  = 0
+                self._close_frostbite_sample(ts, 'untagged')
             if mob:
                 ms = self.mob_stats[mob]
                 if not ms['first_seen_ms']:
@@ -1649,11 +1737,12 @@ class DPSTrackerGUI:
                 else:
                     enc['damage']  += dmg
                     enc['last_ts']  = ts
-            elapsed = (ts - self.out_session.start_ms) / 1000.0
-            self.event_ring.append((ts, 'OUT', dmg, cat, msg))
-            tag = ' BS' if is_backstab else ''
-            self._log(f"  OUT {elapsed:6.2f}s {dmg:>5d} [{cat}]{tag}", 'out')
-            self.status.config(text="Tracking...", fg='#3fb950')
+            if not dmg_live:
+                elapsed = (ts - self.out_session.start_ms) / 1000.0
+                self.event_ring.append((ts, 'OUT', dmg, cat, msg))
+                tag = ' BS' if is_backstab else ''
+                self._log(f"  OUT {elapsed:6.2f}s {dmg:>5d} [{cat}]{tag}", 'out')
+                self.status.config(text="Tracking...", fg='#3fb950')
 
         elif etype == "IN":
             if self._paused:
@@ -1668,10 +1757,15 @@ class DPSTrackerGUI:
             msg = parts[1] if len(parts) > 1 else ""
             cat = categorize_incoming(msg) if msg else 'Unknown'
 
-            if not self.in_session or not self.in_session.active:
-                self._new_session('in')
-            self.in_session.add(ts, dmg, cat)
-            self.last_in_ms = ts
+            # DMG-to-player events own incoming session damage once the player
+            # entity is known; the IN text then only does mob bookkeeping.
+            dmg_live = (self.player_entity_id
+                        and ts - self.dmg_live_ms < 10000)
+            if not dmg_live:
+                if not self.in_session or not self.in_session.active:
+                    self._new_session('in')
+                self.in_session.add(ts, dmg, cat)
+                self.last_in_ms = ts
             # Per-mob incoming attribution (only when we can identify the source)
             src = extract_mob_incoming(msg) if msg else None
             if src:
@@ -1690,10 +1784,11 @@ class DPSTrackerGUI:
                 verb = _extract_incoming_verb(msg)
                 if verb:
                     _update_verb_stat(ms['in_verbs'], verb, dmg)
-            elapsed = (ts - self.in_session.start_ms) / 1000.0
-            cat_tag = f" [{cat}]" if msg else ""
-            self.event_ring.append((ts, 'IN', dmg, cat, msg))
-            self._log(f"   IN {elapsed:6.2f}s {dmg:>5d}{cat_tag}", 'in')
+            if not dmg_live:
+                elapsed = (ts - self.in_session.start_ms) / 1000.0
+                cat_tag = f" [{cat}]" if msg else ""
+                self.event_ring.append((ts, 'IN', dmg, cat, msg))
+                self._log(f"   IN {elapsed:6.2f}s {dmg:>5d}{cat_tag}", 'in')
 
         elif etype == "KILL":
             if not self._paused:
@@ -1714,11 +1809,7 @@ class DPSTrackerGUI:
                     # Close any rolling Frostbite at the moment of death so
                     # we don't keep counting up to the timeout sweep.
                     if self.frostbite_start_ms:
-                        dur = self.frostbite_last_ms - self.frostbite_start_ms
-                        if dur > 0:
-                            self.frostbite_samples.append(dur)
-                        self.frostbite_start_ms = 0
-                        self.frostbite_last_ms  = 0
+                        self._close_frostbite_sample(ts, 'kill')
             self.event_ring.append((ts, 'KILL', 0, '', data))
             self._log(f"  KILL  {data}", 'kill')
             if 'Training Dummy' in data:
@@ -1961,7 +2052,7 @@ class DPSTrackerGUI:
         self.root.mainloop()
 
 
-# ── Java helpers ──────────────────────────────────────────────────────────────
+# ── Client helpers ────────────────────────────────────────────────────────────
 
 def _res_dir():
     return Path(sys._MEIPASS) if getattr(sys, '_MEIPASS', None) else SCRIPT_DIR
@@ -1970,43 +2061,57 @@ def _run_dir():
     return Path(sys.executable).parent if getattr(sys, '_MEIPASS', None) else SCRIPT_DIR
 
 
-def find_java():
-    candidates = []
-    jh = os.environ.get('JAVA_HOME')
-    if jh:
-        candidates.append(Path(jh) / "bin" / "java.exe")
-    # Also search per-user install locations (e.g. Adoptium installed via winget)
-    local_prog = Path(os.environ.get('LOCALAPPDATA', '')) / "Programs"
-    for base in (Path("C:/Program Files/Java"),
-                 Path("C:/Program Files/Eclipse Adoptium"),
-                 Path("C:/Program Files/Android/Android Studio1/jbr"),
-                 Path("C:/Program Files/Microsoft"),
-                 Path("C:/Program Files/Zulu"),
-                 local_prog / "Eclipse Adoptium",
-                 local_prog / "Java",
-                 local_prog / "Microsoft",
-                 local_prog / "Zulu"):
-        if base.is_dir():
-            if (base / "bin" / "java.exe").exists():
-                candidates.append(base / "bin" / "java.exe")
-            else:
-                for child in base.iterdir():
-                    if (child / "bin" / "java.exe").exists():
-                        candidates.append(child / "bin" / "java.exe")
-    p = shutil.which("java")
-    if p:
-        candidates.append(Path(p))
-    for java in candidates:
-        if not java.exists():
-            continue
-        try:
-            r = subprocess.run([str(java), "--list-modules"],
-                               capture_output=True, text=True, timeout=10)
-            if "jdk.attach" in r.stdout:
-                return str(java)
-        except Exception:
-            continue
+CLIENT_EXE_NAME = "WyvernWindowsClient.exe"
+CDP_PORT        = 9222
+
+
+def find_client_exe():
+    """Locate the Steam Wyvern client exe by walking Steam's library folders."""
+    steam_paths = []
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
+            steam_paths.append(Path(winreg.QueryValueEx(k, "SteamPath")[0]))
+    except Exception:
+        pass
+    steam_paths.append(Path("C:/Program Files (x86)/Steam"))
+
+    libraries = []
+    for sp in steam_paths:
+        libraries.append(sp)
+        vdf = sp / "steamapps" / "libraryfolders.vdf"
+        if vdf.exists():
+            try:
+                for m in re.finditer(r'"path"\s+"([^"]+)"', vdf.read_text(errors='ignore')):
+                    libraries.append(Path(m.group(1).replace('\\\\', '\\')))
+            except Exception:
+                pass
+
+    for lib in libraries:
+        exe = lib / "steamapps" / "common" / "Wyvern" / CLIENT_EXE_NAME
+        if exe.exists():
+            return exe
     return None
+
+
+def client_pids():
+    """PIDs of running WyvernWindowsClient processes (empty list if none)."""
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {CLIENT_EXE_NAME}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        pids = []
+        for line in (r.stdout or "").splitlines():
+            parts = line.split('","')
+            if len(parts) >= 2 and CLIENT_EXE_NAME.lower() in parts[0].lower():
+                try:
+                    pids.append(int(parts[1].strip('"')))
+                except ValueError:
+                    pass
+        return pids
+    except Exception:
+        return []
 
 
 def _pid_alive(pid):
@@ -2029,65 +2134,78 @@ def _pid_alive(pid):
         ctypes.windll.kernel32.CloseHandle(handle)
 
 
-def attach_agent():
-    java = find_java()
-    if not java:
-        print("ERROR: No JDK with jdk.attach found.")
-        print("Install a JDK (Java 11+) — https://adoptium.net/")
-        return False
+WEB_CAPTURE = None  # the active web_capture.WebCapture, once attached
 
-    res, run = _res_dir(), _run_dir()
-    # Copy agent.jar to a unique name so the JVM doesn't use a cached class loader
-    # from a previous load in the same session.
-    agent_src  = res / "agent.jar"
-    agent_copy = run / f"agent_{int(time.time())}.jar"
-    shutil.copy2(str(agent_src), str(agent_copy))
-    agent = str(agent_copy)
+
+def _make_event_writer(log_path):
+    """Thread-safe `ETYPE|ts_ms|data` appender (same format the agent wrote)."""
+    lock = threading.Lock()
+
+    def write_event(etype, data):
+        line = f"{etype}|{int(time.time() * 1000)}|{data}\n"
+        with lock:
+            try:
+                with open(log_path, 'a', encoding='utf-8') as fh:
+                    fh.write(line)
+            except OSError:
+                pass
+    return write_event
+
+
+def attach_web():
+    """Attach to the Steam (Electron) client via CDP, launching it if needed.
+
+    Returns True on success, or an error string for main() to print.
+    """
+    import web_capture
+
+    global LOG_FILE, GAME_PID, WEB_CAPTURE
+    run = _run_dir()
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log    = str(run / f"dps_events_{ts_str}.log")
+    LOG_FILE = run / f"dps_events_{ts_str}.log"
 
-    global LOG_FILE
-    LOG_FILE = Path(log)
+    if not web_capture.cdp_alive(CDP_PORT):
+        running = client_pids()
+        if running:
+            print("Wyvern is running but without the debug port the tracker needs.")
+            print("Close Wyvern and the tracker will relaunch it automatically,")
+            print(f"or add  --remote-debugging-port={CDP_PORT}  to its Steam launch")
+            print("options and restart it yourself.  Waiting...")
+            while True:
+                time.sleep(2)
+                if web_capture.cdp_alive(CDP_PORT):
+                    break
+                if not client_pids():
+                    running = []
+                    break
 
-    print(f"Using Java: {java}")
-    print("Attaching to Wyvern JVM...")
-    try:
-        r = subprocess.run(
-            [java, "-cp", str(res / "attacher"), "dps.DPSAttacher", agent, log],
-            capture_output=True, text=True, timeout=15)
-    except subprocess.TimeoutExpired:
-        print("Attach timed out.")
-        return False
+        if not running and not web_capture.cdp_alive(CDP_PORT):
+            exe = find_client_exe()
+            if not exe:
+                return ("Could not find the Steam Wyvern client "
+                        f"({CLIENT_EXE_NAME}). Is it installed?")
+            print(f"Launching {exe.name} with debug port {CDP_PORT}...")
+            proc = subprocess.Popen(
+                [str(exe), f"--remote-debugging-port={CDP_PORT}"],
+                cwd=str(exe.parent))
+            GAME_PID = proc.pid
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if web_capture.cdp_alive(CDP_PORT):
+                    break
+                time.sleep(0.5)
+            else:
+                return "Client launched but its debug port never came up."
 
-    print(r.stdout)
-    try:
-        agent_copy.unlink(missing_ok=True)
-    except Exception:
-        pass
+    if not GAME_PID:
+        pids = client_pids()
+        if pids:
+            GAME_PID = pids[0]
 
-    # Parse the game PID so we can monitor when Wyvern exits and close ourselves.
-    global GAME_PID
-    pid_match = re.search(r'Attaching to PID (\d+):', r.stdout or "")
-    if pid_match:
-        GAME_PID = int(pid_match.group(1))
-
-    # If a live agent from a previous launch is still attached, the attacher
-    # prints "EXISTING:<logpath>" and skips injection. Adopt that log file
-    # instead of the fresh one we just picked.
-    for line in (r.stdout or "").splitlines():
-        if line.startswith("EXISTING:"):
-            existing = line[len("EXISTING:"):].strip()
-            print(f"Reusing existing agent — log: {existing}")
-            LOG_FILE = Path(existing)
-            return True
-
-    if r.returncode != 0:
-        time.sleep(1)
-        if LOG_FILE.exists():
-            print("Agent may already be loaded. Continuing.")
-            return True
-        # Return stderr so main() can print it after the user-facing message
-        return r.stderr.strip() or "Unknown attach error"
+    print("Attaching to Wyvern client...")
+    WEB_CAPTURE = web_capture.WebCapture(
+        CDP_PORT, _make_event_writer(LOG_FILE))
+    WEB_CAPTURE.start()
     return True
 
 
@@ -2102,46 +2220,17 @@ def main():
         input("Press Enter to close...")
         sys.exit(1)
 
-    result = attach_agent()
+    result = attach_web()
     if result is not True:
         print("\nCould not attach to game.")
-        print("  1. Make sure Wyvern is running BEFORE launching the tracker.")
-        print("  2. JDK 11+ installed? (not JRE) — https://adoptium.net/")
-        java = find_java()
-        if not java:
-            print("\n  >> No JDK found!")
-        else:
-            print(f"\n  >> Java found: {java}")
         if isinstance(result, str):
-            print(f"\n  >> Attach output:\n{result}")
-        # Check for agent error file (written on agentmain crash)
-        err_file = LOG_FILE.parent / (LOG_FILE.name + ".err")
-        if err_file.exists():
-            try:
-                print(f"\n  >> Agent error:\n{err_file.read_text()}")
-            except Exception:
-                pass
-        # Also check the guaranteed-writable tmp debug file
-        tmp_dbg = Path(tempfile.gettempdir()) / "dps_agent_debug.txt"
-        if tmp_dbg.exists():
-            try:
-                print(f"\n  >> Agent debug ({tmp_dbg}):\n{tmp_dbg.read_text()}")
-            except Exception:
-                pass
+            print(f"\n  >> {result}")
         input("\nPress Enter to close...")
         sys.exit(1)
 
-    lock = Path(str(LOG_FILE) + ".lock")
-    lh   = open(lock, 'w')
-    lh.write(str(os.getpid()))
-    lh.flush()
-
     def cleanup():
-        try:
-            lh.close()
-            lock.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if WEB_CAPTURE is not None:
+            WEB_CAPTURE.stop()
     atexit.register(cleanup)
 
     print("\nStarting GUI...")

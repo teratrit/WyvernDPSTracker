@@ -297,6 +297,11 @@ TYPE_COLORS = {
     'Poison':  '#00ff7f', 'Holy':    '#da70d6', 'Acid':   '#7fff00',
     # Physical:
     'Cut':     '#ffa500', 'Smash':   '#cd853f', 'Stab':   '#daa520',
+    # DMG-feed types not covered above (colors from the client's own
+    # floating-text palette):
+    'Bite':     '#e07856', 'Slay':  '#ff6b9d', 'Drowning': '#45d0c0',
+    'Magic':    '#e879f9', 'Sun':   '#ffe066', 'Sting':    '#9fe635',
+    'True':     '#ff5555', 'Hit':   '#f4f4f5',
     # Weapon ability:
     'Justice':     '#ffd700',
     'Dream Eater': '#c77dff',
@@ -589,7 +594,6 @@ class DPSTrackerGUI:
         self._mini_kills  = None
         self._mini_top    = None
         # Rolling-window samples for XP rate (deque of (ts_ms, xp))
-        self.xp_recent    = deque(maxlen=200)
         # Last mob the player traded damage with (for active-row highlight)
         self.last_active_mob    = None
         self.last_active_mob_ms = 0
@@ -813,11 +817,6 @@ class DPSTrackerGUI:
         self._mini_kills.config(text=str(self.kill_count))
         top = self.out_session.max_hit if self.out_session else 0
         self._mini_top.config(text=f"{top:,}" if top else "0")
-
-        try:
-            txt.yview_moveto(yview_top)
-        except tk.TclError:
-            pass
 
     def _show_mob_stats(self):
         """Open the live Mob Stats window. If already open, just bring it forward."""
@@ -1161,14 +1160,22 @@ class DPSTrackerGUI:
         KILL line. By then the dead entity has stopped receiving damage while
         AoE survivors kept taking hits, so 'no damage after the kill' singles
         out the right entity. 300ms grace covers in-flight hits."""
+        # Settle all due kills together with closest-match assignment. Chain
+        # kills <300ms apart share candidates: picking the FRESHEST entity
+        # gave kill A the entity killed by B (its killing blow lands inside
+        # A's grace window) - confirmed swaps in live logs. Closest |last_ts
+        # - kill_ts| pairs each kill with its own entity.
+        due = []
         while self.pending_kills and now - self.pending_kills[0][1] > 1200:
-            mob, kill_ts = self.pending_kills.popleft()
+            due.append(self.pending_kills.popleft())
+        for mob, kill_ts in due:
             cands = [e for e, es in self.entity_stats.items()
                      if es['last_ts'] <= kill_ts + 300
                      and kill_ts - es['last_ts'] < 5000]
             if not cands:
                 continue
-            eid = max(cands, key=lambda e: self.entity_stats[e]['last_ts'])
+            eid = min(cands, key=lambda e: abs(
+                self.entity_stats[e]['last_ts'] - kill_ts))
             es = self.entity_stats.pop(eid)
             ms = self.mob_stats[mob]
             ms['damage'] += es['damage']
@@ -1319,6 +1326,10 @@ class DPSTrackerGUI:
                 self.player_entity_id = int(data)
             except ValueError:
                 return
+            # Hits we took before detection were misrouted to the outgoing
+            # branch and opened a ledger under our own entity id - drop it so
+            # it can never be attributed to a kill.
+            self.entity_stats.pop(self.player_entity_id, None)
             self._log(f"  Player entity identified: {data}", 'info')
 
         elif etype == "DMG":
@@ -1510,8 +1521,11 @@ class DPSTrackerGUI:
 
         elif etype == "KILL":
             if not self._paused:
-                self.kill_count += 1
-                self._refresh_exp()
+                # Only OUR kills count - KILL_RE also matches "is destroyed"/
+                # "is dead" lines for deaths we didn't cause.
+                if data.startswith('You '):
+                    self.kill_count += 1
+                    self._refresh_exp()
                 mob = extract_mob_kill(data)
                 if mob:
                     ms = self.mob_stats[mob]
@@ -1522,12 +1536,18 @@ class DPSTrackerGUI:
                     self.last_killed_mob = mob
                     self.last_kill_ms    = ts
                     # Consume XP that arrived just ahead of this kill line.
+                    # Stale amounts (unpaired quest/death-recovery XP) are
+                    # discarded, never credited to a mob.
                     self.last_kill_xp_done = False
-                    if self.pending_xp and ts - self.pending_xp[1] < 2000:
+                    if self.pending_xp and ts - self.pending_xp[1] >= 2000:
+                        self.pending_xp = None
+                    if self.pending_xp:
                         ms['xp'] += self.pending_xp[0]
                         ms['xp_samples'].append(self.pending_xp[0])
+                        self.exp_total += self.pending_xp[0]
                         self.pending_xp = None
                         self.last_kill_xp_done = True
+                        self._refresh_exp()
                     # Entity attribution is deferred (see _settle_pending_kills)
                     # so AoE volleys don't credit a surviving entity.
                     self.pending_kills.append((mob, ts))
@@ -1554,18 +1574,20 @@ class DPSTrackerGUI:
             # the original event time, not wall-clock-now (would inflate rate).
             if self.exp_start_ms == 0:
                 self.exp_start_ms = ts
-            self.exp_total += xp
-            self.xp_recent.append((ts, xp))
-            # Kill-XP pairing. The web feed sends EXP just BEFORE its KILL
-            # line, so normally we hold the amount for the next KILL to
-            # consume. The old ordering (KILL then EXP, seen in v1 log
-            # replays) is covered by attributing directly when the last kill
-            # is fresh and still unpaid.
+            # XP only counts once it pairs with a kill. Unpaired receipts
+            # exist and can be enormous - a death-penalty recovery of 6M XP
+            # was observed, 19x a whole session's kill XP - and would wreck
+            # Total XP / XP-hr if credited.
+            # The web feed sends EXP just BEFORE its KILL line, so normally
+            # the amount is held for the next KILL to consume. The old
+            # ordering (KILL then EXP, seen in v1 log replays) is covered by
+            # attributing directly when the last kill is fresh and unpaid.
             if (self.last_killed_mob and not self.last_kill_xp_done and
                     ts - self.last_kill_ms < 2000):
                 ms = self.mob_stats[self.last_killed_mob]
                 ms['xp'] += xp
                 ms['xp_samples'].append(xp)
+                self.exp_total += xp
                 self.last_kill_xp_done = True
             else:
                 self.pending_xp = (xp, ts)
@@ -1732,11 +1754,12 @@ class DPSTrackerGUI:
         self.last_killed_mob = None
         self.last_kill_ms    = 0
         self.event_ring.clear()
-        self.xp_recent.clear()
         self.entity_stats.clear()
         self.pending_kills.clear()
         self.pending_xp = None
         self.last_kill_xp_done = True
+        self.time_labels["Session Start"].config(text="—")
+        self.time_labels["Duration"].config(text="—")
         self.last_active_mob    = None
         self.last_active_mob_ms = 0
         self.backstab_pending_until_ms = 0

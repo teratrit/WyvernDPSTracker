@@ -67,6 +67,10 @@ STYLE_HIT    = 6   # outgoing (blue)
 FRAME_HEADER_LEN = 8
 MAX_FRAME_LEN    = 10 * 1024 * 1024
 
+# How long an HP-drop IN waits for its matching DMG floating text before
+# being emitted as text-invisible damage (DOTs, drains).
+PENDING_IN_MS = 600
+
 # ── Line classification (port of DPSAgent.processLine) ────────────────────────
 
 DAMAGE_RE = re.compile(r'for\s+(\d+)\s+damage', re.I)
@@ -187,9 +191,14 @@ class CompactReader:
 class FrameBuffer:
     def __init__(self):
         self.buf = b''
+        self.desynced = False   # set when a bogus length forced a buffer drop
 
     def add(self, data):
-        """Append raw WS bytes, return list of (opcode, payload) frames."""
+        """Append raw WS bytes, return list of (opcode, payload) frames.
+
+        On desync the buffer is dropped but frames already parsed from this
+        chunk are still returned; `desynced` is set for the caller to report.
+        """
         self.buf += data
         frames = []
         while len(self.buf) >= FRAME_HEADER_LEN:
@@ -199,7 +208,8 @@ class FrameBuffer:
                 # Desynced — drop the buffer rather than poison every
                 # subsequent parse.
                 self.buf = b''
-                raise ValueError(f'invalid frame size: {length}')
+                self.desynced = True
+                break
             end = FRAME_HEADER_LEN + length
             if len(self.buf) < end:
                 break
@@ -251,9 +261,9 @@ class WebCapture:
         self._ws = None
         self._msg_id = 0
         self._shutdown = False
-        # requestIds of sockets we believe are the game connection. Empty set
-        # = no webSocketCreated seen yet (attached mid-session) → accept all.
-        self._game_sockets = set()
+        # All binary sockets are decoded (per-requestId buffers isolate them,
+        # and non-game streams die as contained desync/decode errors). A URL
+        # allowlist here went deaf on MIGRATE redials to new hosts.
         self._buffers = {}          # requestId -> FrameBuffer
         # HP pairing state (port of DPSAgent.onHpReading)
         self._last_hp = -1
@@ -263,10 +273,16 @@ class WebCapture:
         # Player entity detection: the DMG feed carries damage to every
         # on-screen entity including us. An entity whose DMG amounts repeatedly
         # equal our own HP drops at the same instant is the player. Emitted
-        # once as a PLAYER event so the GUI can classify DMG in/out.
+        # as a PLAYER event so the GUI can classify DMG in/out; re-armed on
+        # reconnect and death since ids can change.
         self._player_entity = 0
         self._player_candidates = {}
         self._last_hp_drop = (0, 0.0)   # (amount, ts_ms)
+        # HP-drop INs are held briefly: the matching DMG-to-player floating
+        # text arrives a few ms later and is the authoritative (typed) record
+        # of the same hit. Only drops with no match within PENDING_IN_MS
+        # (DOTs, drains — no floating text) are emitted as IN.
+        self._pending_ins = []          # [{'dmg', 'msg', 'ts'}]
 
     # -- lifecycle --
 
@@ -304,15 +320,27 @@ class WebCapture:
                 time.sleep(1)
 
     def _attach(self, ws_url):
-        self._game_sockets = set()
         self._buffers = {}
+        # Reset per-connection game state: after a capture gap the old HP
+        # anchor would emit one giant fabricated IN/HEAL, and the player
+        # entity id may have changed (respawn/server migration) — a stale id
+        # silently inverts damage direction downstream. Re-detection takes a
+        # couple of hits and re-emits PLAYER.
+        self._last_hp = -1
+        self._last_max_hp = -1
+        self._pending_in_msg = None
+        self._pending_ins = []
+        self._player_entity = 0
+        self._player_candidates = {}
         self._ws = websocket.WebSocketApp(
             ws_url,
             on_open=self._on_open,
             on_message=self._on_message)
         # suppress_origin: Chrome 111+ rejects CDP websocket connections that
         # carry a browser Origin header unless --remote-allow-origins is set.
-        self._ws.run_forever(suppress_origin=True)
+        # Pings detect half-open CDP pipes that would otherwise hang forever.
+        self._ws.run_forever(suppress_origin=True,
+                             ping_interval=30, ping_timeout=10)
 
     def _send(self, method, params=None):
         self._msg_id += 1
@@ -333,17 +361,10 @@ class WebCapture:
         method = msg.get('method')
         params = msg.get('params', {})
 
-        if method == 'Network.webSocketCreated':
-            if 'ghosttrack.com' in params.get('url', ''):
-                self._game_sockets.add(params.get('requestId'))
-        elif method == 'Network.webSocketClosed':
-            rid = params.get('requestId')
-            self._game_sockets.discard(rid)
-            self._buffers.pop(rid, None)
+        if method == 'Network.webSocketClosed':
+            self._buffers.pop(params.get('requestId'), None)
         elif method == 'Network.webSocketFrameReceived':
             rid = params.get('requestId')
-            if self._game_sockets and rid not in self._game_sockets:
-                return
             resp = params.get('response', {})
             if resp.get('opcode') != 2:   # binary frames only
                 return
@@ -354,12 +375,12 @@ class WebCapture:
             self._feed(rid, data)
 
     def _feed(self, rid, data):
+        self._flush_pending_ins()
         fb = self._buffers.setdefault(rid, FrameBuffer())
-        try:
-            frames = fb.add(data)
-        except ValueError as e:
-            self.write_event('DBG', f'frame_desync|{e}')
-            return
+        frames = fb.add(data)
+        if fb.desynced:
+            fb.desynced = False
+            self.write_event('DBG', f'frame_desync|rid={rid}')
         for opcode, payload in frames:
             try:
                 self._handle_frame(opcode, payload)
@@ -397,6 +418,10 @@ class WebCapture:
             hp, max_hp = stats.get(1), stats.get(2)
             if isinstance(hp, int):
                 self._on_hp(hp, max_hp if isinstance(max_hp, int) else None)
+            elif isinstance(max_hp, int):
+                # maxHp-only update (buff/level with hp unchanged): record the
+                # new baseline so a later hp change isn't misread.
+                self._last_max_hp = max_hp
         elif opcode == OP_CLIENT_ACTION:
             action = CompactReader(payload, PLAIN_STRUCT_OFFSET).read_struct()
             self._handle_client_action(action)
@@ -419,6 +444,14 @@ class WebCapture:
             dtype = d.get('type') if isinstance(d.get('type'), str) else 'hit'
             self.write_event(
                 'DMG', f'{eid}|{int(dmg)}|{dtype}|{int(crit)}|{int(heal)}')
+            # This floating-text hit supersedes the HP-drop IN for the same
+            # damage — cancel the held IN so the GUI doesn't count it twice.
+            if not heal and self._player_entity and eid == self._player_entity:
+                now = time.time() * 1000
+                for p in self._pending_ins:
+                    if p['dmg'] == int(dmg) and now - p['ts'] < PENDING_IN_MS:
+                        self._pending_ins.remove(p)
+                        break
             if not heal and not self._player_entity:
                 drop_amt, drop_ts = self._last_hp_drop
                 if drop_amt == int(dmg) and \
@@ -451,6 +484,13 @@ class WebCapture:
     def _process_line(self, line, style):
         if 'You have died' in line or 'You die' in line:
             self.write_event('DEATH', line)
+            # Invalidate the HP anchor (respawn jumps to full HP - not a
+            # heal) and re-arm player detection (respawn may change our
+            # entity id; a stale id inverts damage direction).
+            self._last_hp = -1
+            self._player_entity = 0
+            self._player_candidates = {}
+            self._pending_ins = []
             return
 
         if KILL_RE.search(line):
@@ -492,18 +532,20 @@ class WebCapture:
     # Port of DPSAgent.onHpReading: incoming damage = HP drop, paired with
     # the last red-styled line if it arrived within 500 ms. HP rises are
     # healing (regen/potions/spells) — reported as HEAL events unless maxHp
-    # changed in the same update (level-up shifts the baseline, not a heal).
+    # changed in the same update (level-up/buff/drain shifts the baseline,
+    # not a heal or a hit). Drops are held briefly and suppressed when the
+    # matching DMG-to-player floating text arrives (it is the authoritative
+    # typed record of the same hit — emitting both double-counted).
     def _on_hp(self, hp, max_hp=None):
         prev = self._last_hp
         max_changed = max_hp is not None and max_hp != self._last_max_hp
         if max_hp is not None:
             self._last_max_hp = max_hp
         self._last_hp = hp
-        if prev <= 0 or hp == prev:
+        if prev <= 0 or hp == prev or max_changed:
             return
         if hp > prev:
-            if not max_changed:
-                self.write_event('HEAL', str(hp - prev))
+            self.write_event('HEAL', str(hp - prev))
             return
         dmg = prev - hp
         msg = self._pending_in_msg
@@ -511,6 +553,23 @@ class WebCapture:
         self._last_hp_drop = (dmg, now)
         if msg is not None and (now - self._pending_in_ts) < 500:
             self._pending_in_msg = None
-            self.write_event('IN', f'{dmg}|{msg}')
         else:
-            self.write_event('IN', str(dmg))
+            msg = None
+        self._pending_ins.append({'dmg': dmg, 'msg': msg, 'ts': now})
+
+    def _flush_pending_ins(self, now=None):
+        """Emit held HP-drop INs whose DMG-match window has expired."""
+        if not self._pending_ins:
+            return
+        if now is None:
+            now = time.time() * 1000
+        keep = []
+        for p in self._pending_ins:
+            if now - p['ts'] >= PENDING_IN_MS:
+                if p['msg'] is not None:
+                    self.write_event('IN', f"{p['dmg']}|{p['msg']}")
+                else:
+                    self.write_event('IN', str(p['dmg']))
+            else:
+                keep.append(p)
+        self._pending_ins = keep

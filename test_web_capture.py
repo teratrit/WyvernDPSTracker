@@ -96,7 +96,32 @@ def test_incoming_pairing():
          frame(OP_TEXT_OUT,
                text_message(STYLE_DAMAGE, 'The goblin bites you for 13 damage.')),
          frame(OP_STAT_UPDATE, stat_update(87, 100)))
+    cap._flush_pending_ins(now=float('inf'))
     assert events == [('IN', '13|The goblin bites you for 13 damage.')], events
+
+
+def test_in_suppressed_by_matching_dmg():
+    """The HP-drop IN and the DMG floating text describe the same hit -
+    only the DMG must be counted."""
+    cap, events = make_capture()
+    cap._player_entity = 999
+    feed(cap,
+         frame(OP_STAT_UPDATE, stat_update(100, 100)),
+         frame(OP_STAT_UPDATE, stat_update(87, 100)),
+         frame(OP_CLIENT_ACTION, client_action(
+             16, '{"id":999,"dmg":13,"type":"cold"}')))
+    cap._flush_pending_ins(now=float('inf'))
+    assert events == [('DMG', '999|13|cold|0|0')], events
+
+
+def test_maxhp_drop_not_damage():
+    """maxHp drain lowers hp with maxHp - a baseline shift, not a hit."""
+    cap, events = make_capture()
+    feed(cap,
+         frame(OP_STAT_UPDATE, stat_update(200, 200)),
+         frame(OP_STAT_UPDATE, stat_update(150, 150)))
+    cap._flush_pending_ins(now=float('inf'))
+    assert events == [], events
 
 
 def test_kill_and_exp():

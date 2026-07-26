@@ -291,55 +291,6 @@ def extract_mob_incoming(msg):
     return None
 
 
-# Wiki monster list - bundled at wyvern_mobs.txt. Used ONLY as a reference
-# indicator in the Mob Stats panel ("is this mob documented on the wiki?").
-# Never used to roll up variants - every distinct name remains its own entry.
-_VARIANT_PREFIXES = {
-    'apex', 'badass', 'huge', 'massive', 'greater', 'lesser',
-    'young', 'ancient', 'arch', 'frozen', 'molten', 'cursed',
-    'corrupted', 'undead', 'demonic', 'shadow',
-}
-
-
-def _load_known_mobs():
-    """Load the canonical mob list from wyvern_mobs.txt if present."""
-    for base in [
-        Path(getattr(sys, '_MEIPASS', '')) if getattr(sys, '_MEIPASS', None) else None,
-        SCRIPT_DIR,
-    ]:
-        if not base:
-            continue
-        path = base / 'wyvern_mobs.txt'
-        if path.exists():
-            try:
-                with open(path, encoding='utf-8') as f:
-                    return {ln.strip() for ln in f if ln.strip()}
-            except OSError:
-                pass
-    return set()
-
-
-KNOWN_MOBS = _load_known_mobs()
-
-
-def is_known_mob(name):
-    """True if `name` (or a prefix-stripped form like 'Banshee' from 'Badass Banshee')
-    is in the wiki list. Cosmetic only - does NOT change how mobs are bucketed.
-    Falls back to title-cased match for lowercase mob names like 'argentavis'."""
-    if not name:
-        return False
-    if name == 'Training Dummy':
-        return True
-    if name in KNOWN_MOBS or name.title() in KNOWN_MOBS:
-        return True
-    words = name.split()
-    while len(words) > 1 and words[0].lower() in _VARIANT_PREFIXES:
-        words = words[1:]
-        candidate = ' '.join(words)
-        if candidate in KNOWN_MOBS or candidate.title() in KNOWN_MOBS:
-            return True
-    return False
-
 TYPE_COLORS = {
     # Elements actually produced by the categorizer:
     'Shock':   '#87ceeb', 'Fire':    '#ff6347', 'Cold':   '#add8e6',
@@ -575,108 +526,10 @@ def _format_in_types(types_dict, total):
     return ' / '.join(parts) if parts else '—'
 
 
-# Sample-size thresholds for wiki output.
-WIKI_MIN_SAMPLES   = 30   # below this, refuse to emit specific numbers for that stat
-WIKI_LOW_CONF_CAP  = 100  # below this, mark the whole block as low confidence
-WIKI_TOP_N_VERBS   = 8    # cap the per-verb damage breakdown to N most-used verbs
-
-
-def _verb_breakdown_lines(verbs):
-    """Bullet-list lines of '* verb min-max (avg X, n=N)' for verbs with n>=WIKI_MIN_SAMPLES,
-    capped at WIKI_TOP_N_VERBS most frequent."""
-    lines = []
-    sorted_verbs = sorted(verbs.items(), key=lambda x: -x[1]['hits'])
-    skipped = 0
-    for v, vs in sorted_verbs:
-        if vs['hits'] < WIKI_MIN_SAMPLES:
-            skipped += 1
-            continue
-        if len(lines) >= WIKI_TOP_N_VERBS:
-            skipped += 1
-            continue
-        avg = vs['damage_total'] / vs['hits']
-        lines.append(f"* {v} {vs['min']}-{vs['max']} (avg {avg:.0f}, n={vs['hits']})")
-    if skipped > 0:
-        lines.append(f"* <!-- {skipped} more verb(s) below n>=30 threshold or capped -->")
-    return lines
-
-
-def _format_mob_for_wiki(mob, stats):
-    """Render one mob's stats as MediaWiki markup, with sample-size gating.
-
-    Each stat is gated independently: damage range needs ≥30 hits for that verb,
-    HP estimate needs ≥30 kills, etc. If the overall block has any stat with
-    n<100 we add a low-confidence HTML comment so the editor knows to wait."""
-    lines = []
-    lines.append(f"== Combat Stats (observed) ==")
-
-    parts = [
-        f"| mob          = {mob}",
-    ]
-    parts.append(f"| variant      = {'base' if is_known_mob(mob) else 'variant/unknown'}")
-
-    # HP estimate from per-encounter total damage to kill
-    enc = stats.get('encounter_damages', [])
-    if len(enc) >= WIKI_MIN_SAMPLES:
-        parts.append(f"| hp_estimate  = ~{max(enc)} (n={len(enc)} kills, max total damage)")
-    elif enc:
-        parts.append(f"| hp_estimate  = <!-- need n>=30, have {len(enc)} -->")
-
-    # XP yield
-    xps = stats.get('xp_samples', [])
-    if len(xps) >= WIKI_MIN_SAMPLES:
-        mean = sum(xps) / len(xps)
-        parts.append(f"| xp_per_kill  = {mean:.0f} (n={len(xps)}, range {min(xps)}-{max(xps)})")
-    elif xps:
-        mean = sum(xps) / len(xps)
-        parts.append(f"| xp_per_kill  = ~{mean:.0f} <!-- need n>=30, have {len(xps)} -->")
-
-    # Damage taken - what verbs the mob hits us with, with ranges (top 8)
-    in_verbs = stats.get('in_verbs') or {}
-    if in_verbs:
-        damage_taken_lines = _verb_breakdown_lines(in_verbs)
-        if damage_taken_lines:
-            parts.append("| damage_taken =")
-            parts.extend(damage_taken_lines)
-
-    # Damage dealt - our attacks vs this mob (top 8)
-    out_verbs = stats.get('out_verbs') or {}
-    if out_verbs:
-        damage_dealt_lines = _verb_breakdown_lines(out_verbs)
-        if damage_dealt_lines:
-            parts.append("| damage_dealt =")
-            parts.extend(damage_dealt_lines)
-
-    # School composition (incoming)
-    in_types = stats.get('in_types') or {}
-    if in_types and stats.get('damage_in', 0) > 0:
-        total = stats['damage_in']
-        items = sorted(in_types.items(), key=lambda x: -x[1])
-        schools = " / ".join(f"{c} {100*d/total:.0f}%" for c, d in items[:4])
-        parts.append(f"| schools_used = {schools}")
-
-    lines.append("{{InfoboxObserved")
-    lines.extend(parts)
-    lines.append("}}")
-
-    # Provenance comment with confidence flag
-    total_n = stats.get('hits', 0) + stats.get('hits_in', 0)
-    n_kills = stats.get('kills', 0)
-    conf = "HIGH" if total_n >= WIKI_LOW_CONF_CAP and n_kills >= 5 else \
-           "LOW — collect more data before publishing" if total_n < WIKI_LOW_CONF_CAP else \
-           "MEDIUM"
-    lines.append(f"<!-- Wyvern Tracker observed-data block")
-    lines.append(f"     Mob: {mob}")
-    lines.append(f"     Total hits sampled: {stats.get('hits', 0)} out, {stats.get('hits_in', 0)} in")
-    lines.append(f"     Kills observed: {n_kills}")
-    lines.append(f"     Confidence: {conf} -->")
-    return "\n".join(lines)
-
-
 def _new_mob_record():
     """Default factory for `mob_stats[mob_name]`. See DPSTrackerGUI.__init__ for the
-    schema. We keep verb-level dicts and per-encounter samples so we can derive
-    wiki-shaped data (HP, damage range, XP variance) without losing distribution info."""
+    schema. Per-encounter samples are kept so HP estimates don't lose
+    distribution info."""
     return {
         'damage':            0,
         'hits':              0,
@@ -685,8 +538,6 @@ def _new_mob_record():
         'damage_in':         0,
         'hits_in':           0,
         'in_types':          {},
-        'out_verbs':         {},
-        'in_verbs':          {},
         'encounter_damages': [],
         'xp_samples':        [],
         'first_seen_ms':     0,
@@ -695,57 +546,6 @@ def _new_mob_record():
         'backstab_hits':     0,
         'out_types':         {},
     }
-
-
-def _update_verb_stat(verbs, verb, dmg):
-    """Accumulate min/max/total for a (mob, verb) bucket."""
-    v = verbs.get(verb)
-    if v is None:
-        verbs[verb] = {'hits': 1, 'damage_total': dmg, 'min': dmg, 'max': dmg}
-    else:
-        v['hits']         += 1
-        v['damage_total'] += dmg
-        if dmg < v['min']: v['min'] = dmg
-        if dmg > v['max']: v['max'] = dmg
-
-
-def _extract_outgoing_verb(msg):
-    """Stable verb label for an outgoing damage message. None if not parseable.
-    Multi-word forms like 'make a hole in' and 'nearly cut in half' get a
-    canonical label so the wiki output reads naturally."""
-    if not msg:
-        return None
-    if msg.startswith('Justice '):
-        return 'Justice'
-    if msg.startswith('Dream Eater '):
-        return 'Dream Eater'
-    if HOLE_RE.search(msg):
-        return 'made a hole in'
-    if NEARLY_CUT_RE.search(msg):
-        return 'nearly cut in half'
-    m = OUTGOING_VERB_RE.match(msg)
-    return m.group(1).lower() if m else None
-
-
-def _extract_incoming_verb(msg):
-    """Pull the matched verb from an incoming damage line."""
-    if not msg:
-        return None
-    if FEEL_RE.match(msg):
-        return 'feel'
-    # Special multi-word patterns
-    if HOLE_RE.search(msg):
-        return 'made a hole in'
-    if NEARLY_CUT_RE.search(msg):
-        return 'nearly cut in half'
-    if TEARS_AT_RE.search(msg):
-        return 'tears at'
-    if RIVES_FLESH_RE.search(msg):
-        return 'rived flesh'
-    if RIPS_FLESH_RE.search(msg):
-        return 'rips flesh'
-    m = INCOMING_VERB_RE.search(msg)
-    return m.group(1).lower() if m else None
 
 
 class DPSTrackerGUI:
@@ -763,8 +563,7 @@ class DPSTrackerGUI:
         #   damage/hits/kills/xp           - running totals
         #   damage_in/hits_in              - running totals
         #   in_types: {cat: damage}        - schools the mob hits us with
-        #   out_verbs: {verb: {hits,damage_total,min,max}}  - our attacks vs this mob
-        #   in_verbs:  {verb: {hits,damage_total,min,max}}  - mob's attacks vs us
+        #   out_types: {cat: damage}       - our damage by school vs this mob
         #   encounter_damages: [int]       - total damage to kill, one per killed instance
         #   xp_samples: [int]              - xp received per kill
         #   first_seen_ms / last_seen_ms   - for time-spent
@@ -1035,60 +834,15 @@ class DPSTrackerGUI:
         txt.pack(fill=tk.BOTH, expand=True)
 
         txt.tag_configure('hdr',       foreground='#d2a8ff')
-        txt.tag_configure('known',     foreground='#c9d1d9')
-        txt.tag_configure('unknown',   foreground='#f0883e')
+        txt.tag_configure('row',       foreground='#c9d1d9')
         txt.tag_configure('dim',       foreground='#7d8590')
         txt.tag_configure('active',    background='#1f3a5a')   # highlight current fight
-
-        # Right-click on any row → context menu with "Copy as wiki markup"
-        txt.bind('<Button-3>', self._on_mob_stats_rightclick)
 
         self._mob_stats_win  = win
         self._mob_stats_text = txt
         # Initial render and start the live-refresh loop
         self._refresh_mob_stats_panel()
         self._schedule_mob_stats_refresh()
-
-    def _on_mob_stats_rightclick(self, event):
-        txt = self._mob_stats_text
-        if not txt:
-            return
-        # Find which row tag covers the click position
-        idx = txt.index(f'@{event.x},{event.y}')
-        mob = None
-        for tag in txt.tag_names(idx):
-            if tag.startswith('mobrow:'):
-                mob = tag[len('mobrow:'):]
-                break
-        if not mob:
-            return
-        # Build the popup menu fresh each time (mob name closure)
-        menu = tk.Menu(self._mob_stats_win, tearoff=0,
-                       bg='#161b22', fg='#c9d1d9', activebackground='#21262d')
-        menu.add_command(label=f"Copy wiki markup — {mob}",
-                         command=lambda m=mob: self._copy_wiki_markup(m))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
-
-    def _copy_wiki_markup(self, mob):
-        """Format the mob's stats as MediaWiki markup and copy to clipboard."""
-        st = self.mob_stats.get(mob)
-        if not st:
-            return
-        text = _format_mob_for_wiki(mob, st)
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self.root.update()  # ensure clipboard is set before window changes
-        # Status feedback in the count label
-        if self._mob_stats_count_lbl:
-            self._mob_stats_count_lbl.config(
-                text=f"Copied wiki markup for: {mob}", fg='#3fb950')
-            # Restore the original text after 2s
-            self.root.after(2000, lambda: self._mob_stats_count_lbl.config(
-                text=f"{len(self.mob_stats)} mobs tracked", fg='#7d8590')
-                            if self._mob_stats_count_lbl else None)
 
     def _close_mob_stats(self):
         if self._mob_stats_win:
@@ -1136,7 +890,6 @@ class DPSTrackerGUI:
 
         rows = sorted(self.mob_stats.items(),
                       key=lambda x: x[1]['damage'] + x[1]['damage_in'], reverse=True)
-        any_unknown = False
         for mob, st in rows:
             avg_out = st['damage']    / st['hits']    if st['hits']    else 0
             avg_in  = st['damage_in'] / st['hits_in'] if st['hits_in'] else 0
@@ -1149,9 +902,6 @@ class DPSTrackerGUI:
                    if st['first_seen_ms'] else 0
             time_str = f"{int(secs // 60)}:{int(secs % 60):02d}" if secs >= 60 \
                        else f"{secs:.1f}s"
-            tag = 'known' if is_known_mob(mob) else 'unknown'
-            if tag == 'unknown':
-                any_unknown = True
             types_str = _format_in_types(st['in_types'], st['damage_in'])
             line = (
                 f"{mob[:26]:<28} {st['kills']:>5}  "
@@ -1160,9 +910,7 @@ class DPSTrackerGUI:
                 f"{st['hits_in']:>7} {st['damage_in']:>8,} {avg_in:>6.0f}  "
                 f"{types_str:<24} "
                 f"{st['xp']:>8,} {time_str:>6}\n")
-            # Per-row tag so we can detect which mob the right-click targets
-            row_tag = f"mobrow:{mob}"
-            tags = [tag, row_tag]
+            tags = ['row']
             # Highlight the row of whatever mob you traded damage with in
             # the last 3 seconds - "current fight" indicator.
             if mob == self.last_active_mob and \
@@ -1170,16 +918,6 @@ class DPSTrackerGUI:
                 tags.append('active')
             txt.insert(tk.END, line, tuple(tags))
 
-        if any_unknown and KNOWN_MOBS:
-            txt.insert(tk.END, "\n", 'dim')
-            txt.insert(tk.END,
-                "Orange = mob isn't in the wiki list. Could be an NPC, a "
-                "newer mob, or a name our parser misread.\n", 'dim')
-        elif not KNOWN_MOBS:
-            txt.insert(tk.END, "\n", 'dim')
-            txt.insert(tk.END,
-                "(wyvern_mobs.txt not bundled — wiki cross-check disabled)\n",
-                'dim')
         txt.config(state=tk.DISABLED)
         # Restore scroll so the viewport doesn't jerk back to the top
         try:
@@ -1599,10 +1337,6 @@ class DPSTrackerGUI:
                 ms['last_seen_ms'] = ts
                 self.last_active_mob    = mob
                 self.last_active_mob_ms = ts
-                # Per-verb stats - used for "X stabs you for 4-9 (n=147)" wiki output
-                verb = _extract_outgoing_verb(msg)
-                if verb:
-                    _update_verb_stat(ms['out_verbs'], verb, dmg)
                 if not dmg_live:
                     ms['damage'] += dmg
                     ms['hits']   += 1
@@ -1659,10 +1393,6 @@ class DPSTrackerGUI:
                 # Track damage by type so the Mob Stats panel can show
                 # exactly what schools each mob hits us with.
                 ms['in_types'][cat] = ms['in_types'].get(cat, 0) + dmg
-                # Per-verb stats for damage range "X bites you for 4-19 (n=89)"
-                verb = _extract_incoming_verb(msg)
-                if verb:
-                    _update_verb_stat(ms['in_verbs'], verb, dmg)
             if not dmg_live:
                 elapsed = (ts - self.in_session.start_ms) / 1000.0
                 cat_tag = f" [{cat}]" if msg else ""
@@ -1814,23 +1544,6 @@ class DPSTrackerGUI:
             return 0
         return self.exp_total * 3600 / elapsed_s
 
-    def _xp_rate_recent(self, window_s=60):
-        """XP/hr over the last `window_s` seconds. Returns 0 if no data."""
-        if not self.xp_recent:
-            return 0
-        now_ms = int(time.time() * 1000)
-        cutoff = now_ms - window_s * 1000
-        # Drop samples that fell out of the window
-        while self.xp_recent and self.xp_recent[0][0] < cutoff:
-            self.xp_recent.popleft()
-        if not self.xp_recent:
-            return 0
-        recent_xp = sum(xp for _, xp in self.xp_recent)
-        # Effective window - bounded by xp_start so a 30s session doesn't
-        # claim a 60s window
-        elapsed = self._xp_elapsed_s()
-        eff = min(elapsed, window_s)
-        return recent_xp * 3600 / eff if eff > 0 else 0
 
     def _print_summary(self):
         elapsed_s = self._xp_elapsed_s()
@@ -1890,19 +1603,9 @@ class DPSTrackerGUI:
         if elapsed_s < 10:
             self.exp_rate_lbl.config(text="… XP/hr", fg='#7d8590')
         else:
-            life_rate   = self._xp_rate(elapsed_s)
-            recent_rate = self._xp_rate_recent(60) if elapsed_s >= 30 else 0
-            arrow = ""
-            if recent_rate > 0:
-                # Show ↑ if last 60s is >10% above lifetime, ↓ if >10% below, → if flat
-                if recent_rate > life_rate * 1.10:
-                    arrow = " ↑"
-                elif recent_rate < life_rate * 0.90:
-                    arrow = " ↓"
-                else:
-                    arrow = " →"
+            life_rate = self._xp_rate(elapsed_s)
             self.exp_rate_lbl.config(
-                text=f"{life_rate:,.0f} XP/hr{arrow}", fg='#d2a8ff')
+                text=f"{life_rate:,.0f} XP/hr", fg='#d2a8ff')
 
     def _reset(self):
         if self.out_session and self.out_session.active:

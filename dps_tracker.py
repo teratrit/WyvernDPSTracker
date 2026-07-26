@@ -543,6 +543,7 @@ def _new_mob_record():
         'in_types':          {},
         'encounter_damages': [],
         'xp_samples':        [],
+        'fight_ms':          0,
         'first_seen_ms':     0,
         'last_seen_ms':      0,
         'backstab_damage':   0,
@@ -609,6 +610,10 @@ class DPSTrackerGUI:
         # survivor. Instead we wait ~1s: the entity that stops receiving
         # damage at the kill is the one that died.
         self.pending_kills = deque()   # (mob_name, kill_ts)
+        # XP pairing: the web client sends "You receive N xp" a moment BEFORE
+        # the kill line, so XP is held here and consumed by the next KILL.
+        self.pending_xp = None         # (amount, ts) or None
+        self.last_kill_xp_done = True
         self._shutdown   = False
         self._build_ui()
         self._start_log_reader()
@@ -907,8 +912,13 @@ class DPSTrackerGUI:
             bs_pct  = (bs_dmg / st['damage'] * 100) if st['damage'] > 0 else 0
             bs_pct_str = f"{bs_pct:>4.0f}%" if bs_hits > 0 else "  -"
             bs_hits_str = str(bs_hits) if bs_hits > 0 else "-"
-            secs = (st['last_seen_ms'] - st['first_seen_ms']) / 1000.0 \
-                   if st['first_seen_ms'] else 0
+            # Prefer accumulated per-fight time (entity attribution); fall
+            # back to the first/last-seen wall span for text-only data.
+            if st.get('fight_ms'):
+                secs = st['fight_ms'] / 1000.0
+            else:
+                secs = (st['last_seen_ms'] - st['first_seen_ms']) / 1000.0 \
+                       if st['first_seen_ms'] else 0
             time_str = f"{int(secs // 60)}:{int(secs % 60):02d}" if secs >= 60 \
                        else f"{secs:.1f}s"
             types_str = _format_in_types(st['in_types'], st['damage_in'])
@@ -1170,6 +1180,12 @@ class DPSTrackerGUI:
             # Exact damage-to-kill for this instance - an HP sample.
             if es['damage'] > 0:
                 ms['encounter_damages'].append(es['damage'])
+            # Fight time: accumulate this instance's first-to-last-hit span.
+            ms['fight_ms'] += max(0, es['last_ts'] - es['first_ts'])
+            if not ms['first_seen_ms'] or es['first_ts'] < ms['first_seen_ms']:
+                ms['first_seen_ms'] = es['first_ts']
+            if es['last_ts'] > ms['last_seen_ms']:
+                ms['last_seen_ms'] = es['last_ts']
 
     def _refresh(self, session, dps_lbl, stats, bd, hi_color, mid_color):
         if not session or session.count == 0:
@@ -1486,6 +1502,13 @@ class DPSTrackerGUI:
                         ms['first_seen_ms'] = ts
                     self.last_killed_mob = mob
                     self.last_kill_ms    = ts
+                    # Consume XP that arrived just ahead of this kill line.
+                    self.last_kill_xp_done = False
+                    if self.pending_xp and ts - self.pending_xp[1] < 2000:
+                        ms['xp'] += self.pending_xp[0]
+                        ms['xp_samples'].append(self.pending_xp[0])
+                        self.pending_xp = None
+                        self.last_kill_xp_done = True
                     # Entity attribution is deferred (see _settle_pending_kills)
                     # so AoE volleys don't credit a surviving entity.
                     self.pending_kills.append((mob, ts))
@@ -1514,12 +1537,19 @@ class DPSTrackerGUI:
                 self.exp_start_ms = ts
             self.exp_total += xp
             self.xp_recent.append((ts, xp))
-            # Attribute XP to the most recently killed mob (within 2 seconds).
-            if (self.last_killed_mob and
+            # Kill-XP pairing. The web feed sends EXP just BEFORE its KILL
+            # line, so normally we hold the amount for the next KILL to
+            # consume. The old ordering (KILL then EXP, seen in v1 log
+            # replays) is covered by attributing directly when the last kill
+            # is fresh and still unpaid.
+            if (self.last_killed_mob and not self.last_kill_xp_done and
                     ts - self.last_kill_ms < 2000):
                 ms = self.mob_stats[self.last_killed_mob]
                 ms['xp'] += xp
                 ms['xp_samples'].append(xp)
+                self.last_kill_xp_done = True
+            else:
+                self.pending_xp = (xp, ts)
             self.event_ring.append((ts, 'EXP', xp, '', ''))
             self._log(f"  EXP  +{xp:,}", 'info')
             self._refresh_exp()
@@ -1686,6 +1716,8 @@ class DPSTrackerGUI:
         self.xp_recent.clear()
         self.entity_stats.clear()
         self.pending_kills.clear()
+        self.pending_xp = None
+        self.last_kill_xp_done = True
         self.last_active_mob    = None
         self.last_active_mob_ms = 0
         self.backstab_pending_until_ms = 0

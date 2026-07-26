@@ -1,4 +1,5 @@
 dps_events*.log
+frostbite_durations.log
 *.lock
 __pycache__/
 *.pyc

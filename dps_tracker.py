@@ -181,6 +181,12 @@ FEEL_RE = re.compile(
 # Strip-based parser: peel off the prefix ("You <verb>", "Justice cleaves", etc.),
 # the "for N damage" tail, and any trailing flavor text. What's left is the mob.
 _DAMAGE_TAIL     = re.compile(r'\s+for\s+\d+\s+damage[!.]?\s*$', re.I)
+# Status-tag suffix the game appends to a mob's name while a debuff is active.
+# Only known-status words are stripped so mob name variants like
+# "Acid Hydros (cursed)" stay intact.
+_STATUS_TAG_RE   = re.compile(r'\s*\((?:Frostbitten)\)', re.I)
+# Quick check whether a damage line currently has the Frostbitten tag on it.
+FROSTBITTEN_RE   = re.compile(r'\(Frostbitten\)', re.I)
 _JUSTICE_CLEAVES = re.compile(r'^Justice\s+cleaves\s+', re.I)
 _JUSTICE_RAINS   = re.compile(r'^Justice\s+rains\s+down.+?\s+upon\s+', re.I)
 _DREAM_EATER     = re.compile(r'^Dream\s+Eater\s+rips\s+through\s+', re.I)
@@ -234,7 +240,10 @@ def extract_mob_outgoing(msg):
         if new_s == s:
             break
         s = new_s
-    return s.strip() or None
+    # Strip any status tag like "(Frostbitten)" so the mob still rolls up
+    # under its base name in stats.
+    s = _STATUS_TAG_RE.sub('', s).strip()
+    return s or None
 
 
 def extract_mob_kill(line):
@@ -431,6 +440,9 @@ def categorize_incoming(msg):
 
 HITS_BUFFER_MAX = 5000
 BACKSTAB_TIMEOUT_MS = 2000
+# Time without seeing "(Frostbitten)" on a mob before we consider its
+# Frostbite debuff expired and record the duration.
+FROSTBITE_TIMEOUT_MS = 5000
 
 
 @dataclass
@@ -778,6 +790,14 @@ class DPSTrackerGUI:
         # Last mob the player traded damage with (for active-row highlight)
         self.last_active_mob    = None
         self.last_active_mob_ms = 0
+        # Frostbite tracking, single-target assumption: we see "(Frostbitten)"
+        # somewhere in chat, that's our active timer. First non-tagged player
+        # hit closes the sample.
+        self.frostbite_start_ms = 0
+        self.frostbite_last_ms  = 0
+        self.frostbite_samples  = deque(maxlen=200)
+        self._frost_win  = None
+        self._frost_text = None
         self._shutdown   = False
         self._build_ui()
         self._start_log_reader()
@@ -862,6 +882,9 @@ class DPSTrackerGUI:
                   side=tk.LEFT, padx=(0, 4))
         tk.Button(bf, text="Mini (F11)", font=sm, bg='#21262d', fg='#c9d1d9',
                   bd=0, cursor='hand2', width=10, command=self._toggle_mini).pack(
+                  side=tk.LEFT, padx=(0, 4))
+        tk.Button(bf, text="Frostbite", font=sm, bg='#21262d', fg='#c9d1d9',
+                  bd=0, cursor='hand2', width=10, command=self._show_frostbite).pack(
                   side=tk.LEFT)
 
 
@@ -976,6 +999,100 @@ class DPSTrackerGUI:
         self._mini_kills.config(text=str(self.kill_count))
         top = self.out_session.max_hit if self.out_session else 0
         self._mini_top.config(text=f"{top:,}" if top else "0")
+
+    def _show_frostbite(self):
+        """Open the live Frostbite tracker, or bring it forward if already open."""
+        if self._frost_win and self._frost_win.winfo_exists():
+            self._frost_win.lift()
+            self._frost_win.focus_set()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Frostbite")
+        win.configure(bg='#0d1117')
+        win.geometry('480x420')
+        win.protocol('WM_DELETE_WINDOW', self._close_frostbite)
+
+        txt = tk.Text(win, bg='#161b22', fg='#c9d1d9', font=('Consolas', 9),
+                      bd=0, wrap=tk.NONE)
+        txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        for tag, fg in [('hdr', '#d2a8ff'), ('active', '#87ceeb'),
+                        ('row', '#c9d1d9'), ('dim', '#7d8590')]:
+            txt.tag_configure(tag, foreground=fg)
+
+        self._frost_win  = win
+        self._frost_text = txt
+        self._refresh_frostbite_panel()
+        self._schedule_frostbite_refresh()
+
+    def _close_frostbite(self):
+        if self._frost_win:
+            try:
+                self._frost_win.destroy()
+            except Exception:
+                pass
+        self._frost_win  = None
+        self._frost_text = None
+
+    def _schedule_frostbite_refresh(self):
+        if self._shutdown:
+            return
+        if not self._frost_win or not self._frost_win.winfo_exists():
+            self._frost_win  = None
+            self._frost_text = None
+            return
+        self._refresh_frostbite_panel()
+        self.root.after(1000, self._schedule_frostbite_refresh)
+
+    def _refresh_frostbite_panel(self):
+        txt = self._frost_text
+        if not txt:
+            return
+        try:
+            yview_top = txt.yview()[0]
+        except tk.TclError:
+            return
+        now = int(time.time() * 1000)
+        txt.config(state=tk.NORMAL)
+        txt.delete('1.0', tk.END)
+
+        txt.insert(tk.END, "Currently active\n", 'hdr')
+        txt.insert(tk.END, "-" * 50 + "\n", 'dim')
+        if self.frostbite_start_ms:
+            elapsed = (now - self.frostbite_start_ms) / 1000.0
+            since   = (now - self.frostbite_last_ms)  / 1000.0
+            txt.insert(tk.END,
+                f"  rolling {elapsed:>5.1f}s  (last seen {since:.1f}s ago)\n",
+                'active')
+        else:
+            txt.insert(tk.END, "  (inactive)\n", 'dim')
+
+        txt.insert(tk.END, "\n")
+        txt.insert(tk.END, f"Recent durations  (n={len(self.frostbite_samples)})\n", 'hdr')
+        txt.insert(tk.END, "-" * 50 + "\n", 'dim')
+        if self.frostbite_samples:
+            for dur_ms in list(self.frostbite_samples)[-15:][::-1]:
+                txt.insert(tk.END, f"  {dur_ms/1000.0:>5.1f}s\n", 'row')
+        else:
+            txt.insert(tk.END, "  (none yet)\n", 'dim')
+
+        if self.frostbite_samples:
+            durs = sorted(self.frostbite_samples)
+            n = len(durs)
+            mean   = sum(durs) / n
+            median = durs[n // 2]
+            txt.insert(tk.END, "\n")
+            txt.insert(tk.END, "Summary\n", 'hdr')
+            txt.insert(tk.END, "-" * 50 + "\n", 'dim')
+            txt.insert(tk.END, f"  Mean:   {mean/1000.0:>5.2f}s\n", 'row')
+            txt.insert(tk.END, f"  Median: {median/1000.0:>5.2f}s\n", 'row')
+            txt.insert(tk.END, f"  Min:    {min(durs)/1000.0:>5.2f}s\n", 'row')
+            txt.insert(tk.END, f"  Max:    {max(durs)/1000.0:>5.2f}s\n", 'row')
+
+        txt.config(state=tk.DISABLED)
+        try:
+            txt.yview_moveto(yview_top)
+        except tk.TclError:
+            pass
 
     def _show_mob_stats(self):
         """Open the live Mob Stats window. If already open, just bring it forward."""
@@ -1332,6 +1449,19 @@ class DPSTrackerGUI:
             for m in stale:
                 del self.active_encounters[m]
 
+        # Close out a rolling frostbite that hasn't been refreshed within the
+        # timeout - mob died silently, we walked away, etc. Use the latest
+        # event ts (not wall-clock now) so log replays don't flush on the
+        # first tick. Skip zero-duration samples.
+        if self.frostbite_start_ms:
+            latest_event_ms = max(self.last_out_ms, self.last_in_ms)
+            if latest_event_ms and latest_event_ms - self.frostbite_last_ms > FROSTBITE_TIMEOUT_MS:
+                dur = self.frostbite_last_ms - self.frostbite_start_ms
+                if dur > 0:
+                    self.frostbite_samples.append(dur)
+                self.frostbite_start_ms = 0
+                self.frostbite_last_ms  = 0
+
         self._refresh(self.out_session, self.out_dps, self.out_stats, self.out_bd, '#3fb950', '#58a6ff')
         self._refresh(self.in_session,  self.in_dps,  self.in_stats,  self.in_bd,  '#f85149', '#d29922')
         self._refresh_exp()
@@ -1482,6 +1612,20 @@ class DPSTrackerGUI:
             self.last_out_ms = ts
             # Per-mob accounting
             mob = extract_mob_outgoing(msg)
+            # Frostbite duration tracking. Single-target assumption: any chat
+            # line with "(Frostbitten)" means the debuff is rolling. An OUT
+            # hit on a mob WITHOUT the tag means it's worn off, so we close
+            # the sample. _tick handles silent expiry (timeout sweep).
+            if FROSTBITTEN_RE.search(msg):
+                if self.frostbite_start_ms == 0:
+                    self.frostbite_start_ms = ts
+                self.frostbite_last_ms = ts
+            elif self.frostbite_start_ms:
+                dur = self.frostbite_last_ms - self.frostbite_start_ms
+                if dur > 0:
+                    self.frostbite_samples.append(dur)
+                self.frostbite_start_ms = 0
+                self.frostbite_last_ms  = 0
             if mob:
                 ms = self.mob_stats[mob]
                 if not ms['first_seen_ms']:
@@ -1567,6 +1711,14 @@ class DPSTrackerGUI:
                     enc = self.active_encounters.pop(mob, None)
                     if enc and enc['damage'] > 0:
                         ms['encounter_damages'].append(enc['damage'])
+                    # Close any rolling Frostbite at the moment of death so
+                    # we don't keep counting up to the timeout sweep.
+                    if self.frostbite_start_ms:
+                        dur = self.frostbite_last_ms - self.frostbite_start_ms
+                        if dur > 0:
+                            self.frostbite_samples.append(dur)
+                        self.frostbite_start_ms = 0
+                        self.frostbite_last_ms  = 0
             self.event_ring.append((ts, 'KILL', 0, '', data))
             self._log(f"  KILL  {data}", 'kill')
             if 'Training Dummy' in data:
@@ -1787,6 +1939,9 @@ class DPSTrackerGUI:
         self.last_active_mob    = None
         self.last_active_mob_ms = 0
         self.backstab_pending_until_ms = 0
+        self.frostbite_start_ms = 0
+        self.frostbite_last_ms  = 0
+        self.frostbite_samples.clear()
         # Note: history panel is intentionally NOT cleared here - survives Reset
         # so the user can review past sessions/deaths after wiping live state.
         self.exp_labels["Total XP"].config(text="0")

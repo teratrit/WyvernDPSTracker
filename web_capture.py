@@ -235,14 +235,29 @@ def cdp_alive(port):
 
 
 def find_game_target(port):
-    """The game page's webSocketDebuggerUrl, or None."""
+    """The game page's webSocketDebuggerUrl, or None.
+
+    Handles both the Steam Electron client (app:// origin) and a browser
+    playing play.ghosttrack.com; prefers the actual game tab when a browser
+    has multiple ghosttrack pages open.
+    """
+    best = None
+    best_rank = 0
     for t in cdp_targets(port):
         if t.get('type') != 'page':
             continue
         url = t.get('url', '')
-        if url.startswith('app://') or 'ghosttrack.com' in url:
-            return t.get('webSocketDebuggerUrl')
-    return None
+        if 'play.ghosttrack.com' in url:
+            rank = 3
+        elif url.startswith('app://'):
+            rank = 2
+        elif 'ghosttrack.com' in url:
+            rank = 1
+        else:
+            continue
+        if rank > best_rank:
+            best, best_rank = t.get('webSocketDebuggerUrl'), rank
+    return best
 
 
 # ── Capture ───────────────────────────────────────────────────────────────────

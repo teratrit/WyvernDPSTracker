@@ -1882,8 +1882,64 @@ def _make_event_writer(log_path):
     return write_event
 
 
-def attach_web():
-    """Attach to the Steam (Electron) client via CDP, launching it if needed.
+GAME_URL = "https://play.ghosttrack.com/game"
+
+# Chromium-based browsers we can drive for browser play, in preference order.
+_BROWSER_CANDIDATES = [
+    ("Chrome", [
+        Path(os.environ.get('ProgramFiles', 'C:/Program Files'))
+        / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)'))
+        / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get('LOCALAPPDATA', ''))
+        / "Google/Chrome/Application/chrome.exe",
+    ]),
+    ("Edge", [
+        Path(os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)'))
+        / "Microsoft/Edge/Application/msedge.exe",
+        Path(os.environ.get('ProgramFiles', 'C:/Program Files'))
+        / "Microsoft/Edge/Application/msedge.exe",
+    ]),
+]
+
+
+def find_browser_exe():
+    """(name, path) of an installed Chromium browser, or (None, None)."""
+    for name, paths in _BROWSER_CANDIDATES:
+        for p in paths:
+            if p.exists():
+                return name, p
+    return None, None
+
+
+def launch_browser_client():
+    """Launch Chrome/Edge with the debug port on the game URL.
+
+    Modern Chrome only honors --remote-debugging-port together with a
+    non-default --user-data-dir, so the tracker keeps its own browser profile
+    (game login persists there between runs).
+
+    Returns the Popen process, or an error string.
+    """
+    name, exe = find_browser_exe()
+    if not exe:
+        return "No Chrome or Edge installation found for browser play."
+    profile = Path(os.environ.get('LOCALAPPDATA', str(_run_dir()))) \
+        / "WyvernDPSTracker" / "browser-profile"
+    profile.mkdir(parents=True, exist_ok=True)
+    print(f"Launching {name} (tracker profile) at {GAME_URL}...")
+    return subprocess.Popen([
+        str(exe),
+        f"--remote-debugging-port={CDP_PORT}",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        GAME_URL,
+    ])
+
+
+def attach_web(prefer_browser=False):
+    """Attach to the game via CDP — the Steam Electron client or a Chromium
+    browser playing play.ghosttrack.com — launching one if needed.
 
     Returns True on success, or an error string for main() to print.
     """
@@ -1896,7 +1952,7 @@ def attach_web():
 
     if not web_capture.cdp_alive(CDP_PORT):
         running = client_pids()
-        if running:
+        if running and not prefer_browser:
             print("Wyvern is running but without the debug port the tracker needs.")
             print("Close Wyvern and the tracker will relaunch it automatically,")
             print(f"or add  --remote-debugging-port={CDP_PORT}  to its Steam launch")
@@ -1909,16 +1965,22 @@ def attach_web():
                     running = []
                     break
 
-        if not running and not web_capture.cdp_alive(CDP_PORT):
-            exe = find_client_exe()
-            if not exe:
-                return ("Could not find the Steam Wyvern client "
-                        f"({CLIENT_EXE_NAME}). Is it installed?")
-            print(f"Launching {exe.name} with debug port {CDP_PORT}...")
-            proc = subprocess.Popen(
-                [str(exe), f"--remote-debugging-port={CDP_PORT}"],
-                cwd=str(exe.parent))
-            GAME_PID = proc.pid
+        if not web_capture.cdp_alive(CDP_PORT):
+            steam_exe = None if prefer_browser else find_client_exe()
+            if steam_exe:
+                print(f"Launching {steam_exe.name} with debug port {CDP_PORT}...")
+                proc = subprocess.Popen(
+                    [str(steam_exe), f"--remote-debugging-port={CDP_PORT}"],
+                    cwd=str(steam_exe.parent))
+                GAME_PID = proc.pid
+            else:
+                proc = launch_browser_client()
+                if isinstance(proc, str):
+                    return proc
+                # No PID watch for browsers: the Chromium launcher process
+                # hands off and exits immediately, which would read as "game
+                # closed". The capture's CDP disconnect detection covers the
+                # browser actually closing.
             deadline = time.time() + 30
             while time.time() < deadline:
                 if web_capture.cdp_alive(CDP_PORT):
@@ -1927,12 +1989,12 @@ def attach_web():
             else:
                 return "Client launched but its debug port never came up."
 
-    if not GAME_PID:
+    if not GAME_PID and not prefer_browser:
         pids = client_pids()
         if pids:
             GAME_PID = pids[0]
 
-    print("Attaching to Wyvern client...")
+    print("Attaching to Wyvern...")
     WEB_CAPTURE = web_capture.WebCapture(
         CDP_PORT, _make_event_writer(LOG_FILE))
     WEB_CAPTURE.start()
@@ -1950,7 +2012,7 @@ def main():
         input("Press Enter to close...")
         sys.exit(1)
 
-    result = attach_web()
+    result = attach_web(prefer_browser='--browser' in sys.argv)
     if result is not True:
         print("\nCould not attach to game.")
         if isinstance(result, str):

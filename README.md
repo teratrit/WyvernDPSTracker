@@ -16,15 +16,24 @@ Grab `WyvernDPSTracker.exe` from the [latest release](https://github.com/teratri
 
 ## Requirements
 
-- Wyvern on Steam (the current Electron client). No JDK needed anymore.
+- Wyvern on Steam (the current Electron client), OR any Chromium browser
+  (Chrome/Edge) for play.ghosttrack.com. No JDK needed anymore.
 
 ## Usage
 
+**Steam:**
 1. Run `WyvernDPSTracker.exe`
 2. If Wyvern isn't running, the tracker launches it for you.
    If Wyvern IS already running, close it first (or add
    `--remote-debugging-port=9222` to its Steam launch options once, and the
    tracker will attach to the running game from then on).
+3. Fight stuff
+
+**Browser:**
+1. Run `WyvernDPSTracker.exe --browser`
+2. The tracker opens Chrome/Edge with its own profile at
+   play.ghosttrack.com — log in there (remembered between runs) and play.
+   The `--browser` flag also skips the Steam client when both are installed.
 3. Fight stuff
 
 Sessions auto-start when you deal or take damage and auto-end after quiet
